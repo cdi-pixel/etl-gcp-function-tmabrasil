@@ -1,11 +1,17 @@
-name: Terraform GCP Function
+name: Deploy Cloud Function (zip app + Terraform)
 
 on:
   push:
     branches: [ "main" ]
+  pull_request:
+    paths:
+      - "app/**"
+      - "**/*.tf"
+      - ".github/workflows/deploy-cloud-function.yml"
 
 permissions:
   contents: read
+  id-token: write   # necessário apenas se usar WIF (bloco comentado abaixo)
 
 jobs:
   deploy:
@@ -19,18 +25,58 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps into ./app
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f app/requirements.txt ]; then
+            python -m pip install -r app/requirements.txt -t app/
+          fi
+
+      - name: Build zip from ./app
+        run: |
+          mkdir -p build
+          cd app
+          zip -r ../build/function.zip .
+
+      - name: Show zip size
+        run: du -h build/function.zip
+
+      # --- AUTENTICAÇÃO (escolha 1 dos métodos) ---
+
+      # 1) Service Account JSON (seu caso atual)
+      - name: Write SA key file
+        if: env.GCP_SA_KEY != ''
+        run: echo "$GCP_SA_KEY" > sa.json
+
+      # 2) (Opcional) WIF OIDC - se quiser trocar futuramente:
+      # - name: Auth via WIF
+      #   uses: google-github-actions/auth@v2
+      #   with:
+      #     token_format: 'access_token'
+      #     workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+      #     service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      # Cria o arquivo JSON local com o conteúdo do secret
-      - name: Create service account key file
-        run: echo "$GCP_SA_KEY" > sa.json
-
       - name: Terraform Init
-        run: terraform init
+        run: terraform init -input=false
 
-      - name: Terraform Apply
+      - name: Terraform Plan
+        if: github.event_name == 'pull_request'
         run: |
-          terraform apply -auto-approve \
+          terraform plan -input=false \
+            -var="project_id=${{ env.GCP_PROJECT_ID }}" \
+            -var="credentials_file=sa.json"
+
+      - name: Terraform Apply (main)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          terraform apply -auto-approve -input=false \
             -var="project_id=${{ env.GCP_PROJECT_ID }}" \
             -var="credentials_file=sa.json"
