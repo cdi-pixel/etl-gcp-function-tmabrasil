@@ -10,7 +10,25 @@ terraform {
 provider "google" {
   project     = var.project_id
   region      = var.region
-  credentials = file(var.credentials_file)  # <- usa o sa.json
+  credentials = file(var.credentials_file)  # usa o sa.json criado no workflow
+}
+
+# --- Ativa as APIs necessárias antes do deploy ---
+locals {
+  required_services = [
+    "cloudfunctions.googleapis.com",    # Cloud Functions (Gen2)
+    "run.googleapis.com",               # Cloud Run
+    "artifactregistry.googleapis.com",  # Artifact Registry
+    "cloudbuild.googleapis.com",        # Cloud Build
+    "storage.googleapis.com",           # Cloud Storage
+  ]
+}
+
+resource "google_project_service" "required" {
+  for_each           = toset(local.required_services)
+  project            = var.project_id
+  service            = each.value
+  disable_on_destroy = false
 }
 
 # Bucket p/ código
@@ -19,14 +37,21 @@ resource "google_storage_bucket" "function_bucket" {
   location                    = var.region
   uniform_bucket_level_access = true
   force_destroy               = true
+
+  depends_on = [for s in google_project_service.required : s]
 }
 
-# Usa o ZIP gerado no workflow
-# Dica: usar nome com hash força rebuild quando o zip muda
+# Usa o ZIP gerado no workflow (build/function.zip)
+# Nome com hash -> força rebuild quando o zip muda
 resource "google_storage_bucket_object" "function_code" {
   name   = "source-${substr(filemd5("build/function.zip"), 0, 8)}.zip"
   bucket = google_storage_bucket.function_bucket.name
   source = "build/function.zip"
+
+  depends_on = [
+    google_storage_bucket.function_bucket,
+    for s in google_project_service.required : s
+  ]
 }
 
 resource "google_cloudfunctions2_function" "fn" {
@@ -52,4 +77,6 @@ resource "google_cloudfunctions2_function" "fn" {
     max_instance_count = 3
     ingress_settings   = "ALLOW_ALL"
   }
+
+  depends_on = [for s in google_project_service.required : s]
 }
