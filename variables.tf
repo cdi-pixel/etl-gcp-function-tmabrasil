@@ -1,16 +1,14 @@
 variable "project_id" {
-  description = "ID do projeto GCP"
   type        = string
+  description = "ID do projeto GCP"
 }
 
 variable "region" {
-  description = "Região da função"
   type        = string
   default     = "us-central1"
 }
 
-variable "gcp_credentials_json" {
-  description = "Conteúdo JSON das credenciais do Service Account"
+variable "credentials_file" {
   type        = string
-  sensitive   = true
+  description = "Caminho para o arquivo de credenciais JSON"
 }

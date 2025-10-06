@@ -1,20 +1,9 @@
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    google = {
-      source  = "hashicorp/google"
-      version = "~> 5.0"
-    }
-  }
-}
-
 provider "google" {
   project     = var.project_id
   region      = var.region
-  credentials = var.gcp_credentials_json
+  credentials = file(var.credentials_file)
 }
 
-# Bucket que armazenará o código da função
 resource "google_storage_bucket" "function_bucket" {
   name                        = "${var.project_id}-function-bucket"
   location                    = var.region
@@ -22,14 +11,12 @@ resource "google_storage_bucket" "function_bucket" {
   force_destroy               = true
 }
 
-# Upload do ZIP para o bucket
 resource "google_storage_bucket_object" "function_code" {
   name   = "function.zip"
   bucket = google_storage_bucket.function_bucket.name
   source = "${path.module}/function.zip"
 }
 
-# Função Cloud Function (Gen2, HTTP)
 resource "google_cloudfunctions2_function" "hello_function" {
   name        = "hello-world-function"
   location    = var.region
@@ -38,7 +25,6 @@ resource "google_cloudfunctions2_function" "hello_function" {
   build_config {
     runtime     = "python312"
     entry_point = "hello_world"
-
     source {
       storage_source {
         bucket = google_storage_bucket.function_bucket.name
@@ -48,15 +34,9 @@ resource "google_cloudfunctions2_function" "hello_function" {
   }
 
   service_config {
-    available_memory   = "256M"
-    max_instance_count = 3
-    timeout_seconds    = 60
-    ingress_settings   = "ALLOW_ALL"
-  }
-
-  labels = {
-    environment = "dev"
-    managed_by  = "terraform"
+    available_memory = "256M"
+    timeout_seconds  = 60
+    ingress_settings = "ALLOW_ALL"
   }
 }
 

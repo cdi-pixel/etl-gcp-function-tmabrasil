@@ -1,20 +1,14 @@
-name: Terraform GCP Cloud Function
+name: Terraform GCP Function
 
 on:
   push:
     branches: [ "main" ]
-  pull_request:
-    paths:
-      - "**.tf"
-      - "function.zip"
-      - ".github/workflows/terraform.yml"
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  terraform:
+  deploy:
     runs-on: ubuntu-latest
 
     env:
@@ -28,22 +22,15 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      # Cria o arquivo JSON local com o conteúdo do secret
+      - name: Create service account key file
+        run: echo "$GCP_SA_KEY" > sa.json
+
       - name: Terraform Init
-        run: terraform init -input=false
-
-      - name: Terraform Validate
-        run: terraform validate
-
-      - name: Terraform Plan
-        run: |
-          terraform plan -input=false \
-            -var="project_id=${{ env.GCP_PROJECT_ID }}" \
-            -var="gcp_credentials_json=${{ env.GCP_SA_KEY }}"
-        if: github.event_name == 'pull_request'
+        run: terraform init
 
       - name: Terraform Apply
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          terraform apply -auto-approve -input=false \
+          terraform apply -auto-approve \
             -var="project_id=${{ env.GCP_PROJECT_ID }}" \
-            -var="gcp_credentials_json=${{ env.GCP_SA_KEY }}"
+            -var="credentials_file=sa.json"
