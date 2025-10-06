@@ -13,7 +13,7 @@ provider "google" {
   credentials = file(var.credentials_file)  # usa o sa.json criado no workflow
 }
 
-# --- Ativa as APIs necessárias antes do deploy ---
+# --- Liga as APIs necessárias ---
 locals {
   required_services = [
     "cloudfunctions.googleapis.com",    # Cloud Functions (Gen2)
@@ -38,11 +38,17 @@ resource "google_storage_bucket" "function_bucket" {
   uniform_bucket_level_access = true
   force_destroy               = true
 
-  depends_on = [for s in google_project_service.required : s]
+  # depends_on precisa ser ESTÁTICO (endereços explícitos):
+  depends_on = [
+    google_project_service.required["cloudfunctions.googleapis.com"],
+    google_project_service.required["run.googleapis.com"],
+    google_project_service.required["artifactregistry.googleapis.com"],
+    google_project_service.required["cloudbuild.googleapis.com"],
+    google_project_service.required["storage.googleapis.com"],
+  ]
 }
 
 # Usa o ZIP gerado no workflow (build/function.zip)
-# Nome com hash -> força rebuild quando o zip muda
 resource "google_storage_bucket_object" "function_code" {
   name   = "source-${substr(filemd5("build/function.zip"), 0, 8)}.zip"
   bucket = google_storage_bucket.function_bucket.name
@@ -50,10 +56,15 @@ resource "google_storage_bucket_object" "function_code" {
 
   depends_on = [
     google_storage_bucket.function_bucket,
-    for s in google_project_service.required : s
+    google_project_service.required["cloudfunctions.googleapis.com"],
+    google_project_service.required["run.googleapis.com"],
+    google_project_service.required["artifactregistry.googleapis.com"],
+    google_project_service.required["cloudbuild.googleapis.com"],
+    google_project_service.required["storage.googleapis.com"],
   ]
 }
 
+# Cloud Function Gen2 (HTTP, Python 3.12)
 resource "google_cloudfunctions2_function" "fn" {
   name        = var.function_name
   location    = var.region
@@ -78,5 +89,11 @@ resource "google_cloudfunctions2_function" "fn" {
     ingress_settings   = "ALLOW_ALL"
   }
 
-  depends_on = [for s in google_project_service.required : s]
+  depends_on = [
+    google_project_service.required["cloudfunctions.googleapis.com"],
+    google_project_service.required["run.googleapis.com"],
+    google_project_service.required["artifactregistry.googleapis.com"],
+    google_project_service.required["cloudbuild.googleapis.com"],
+    google_project_service.required["storage.googleapis.com"],
+  ]
 }
