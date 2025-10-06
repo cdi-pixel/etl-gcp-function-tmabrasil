@@ -1,3 +1,18 @@
+terraform {
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "google" {
+  project     = var.project_id
+  region      = var.region
+  credentials = file(var.credentials_file)  # <- usa o sa.json
+}
+
 # Bucket p/ código
 resource "google_storage_bucket" "function_bucket" {
   name                        = "${var.project_id}-function-bucket"
