@@ -160,7 +160,7 @@ resource "google_cloudfunctions2_function" "fn" {
   depends_on = [
     google_project_service.services,
     google_storage_bucket.code_bucket,
-    google_storage_bucket.xlsx_bucket
+    google_storage_bucket.xlsx_bucket,
     google_project_iam_member.gcs_pubsub_publisher
   ]
 }
