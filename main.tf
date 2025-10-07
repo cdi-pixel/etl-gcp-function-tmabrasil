@@ -55,4 +55,25 @@ resource "google_cloudfunctions2_function" "fn" {
     # recomendo fixar a SA de runtime:
     service_account_email   = var.runtime_service_account # ex: "cf-runtime@tmabrasil.iam.gserviceaccount.com"
   }
+
+  event_trigger {
+    trigger_region        = var.region
+    event_type            = "google.cloud.storage.object.v1.finalized"
+    retry_policy          = "RETRY_POLICY_RETRY"
+    service_account_email = var.runtime_service_account
+
+    # filtro exato do bucket
+    event_filters {
+      attribute = "bucket"
+      value     = google_storage_bucket.trigger.name
+    }
+
+    # opcional: limitar à pasta e extensão via path pattern (Eventarc)
+    event_filters {
+      attribute = "bucket"
+      operator  = "match-path-pattern"
+      value     = "/projects/_/buckets/${google_storage_bucket.trigger.name}/objects/*.xlsx"
+    }
+  }
+
 }
