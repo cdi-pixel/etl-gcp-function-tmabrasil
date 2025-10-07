@@ -1,11 +1,12 @@
-name: Deploy Cloud Function (zip app + Terraform)
+name: Deploy Cloud Function (zip root + Terraform)
 
 on:
   push:
     branches: [ "develop" ]
   pull_request:
     paths:
-      - "app/**"
+      - "main.py"
+      - "requirements.txt"
       - "**/*.tf"
       - ".github/workflows/deploy-cloud-function.yml"
 
@@ -19,29 +20,38 @@ jobs:
 
     env:
       GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      # TF vars padrão (ajuste se quiser usar .tfvars)
+      TF_VAR_project_id: ${{ secrets.GCP_PROJECT_ID }}
+      TF_VAR_region: us-central1
+      TF_VAR_function_name: xlsx-folder-trigger
+      TF_VAR_entry_point: entryPoint
+      TF_VAR_runtime_service_account: cf-runtime@tmabrasil.iam.gserviceaccount.com
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Python só se você precisar rodar passos que usem Python (opcional para zip)
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Install deps into ./app
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f app/requirements.txt ]; then
-            python -m pip install -r app/requirements.txt -t app/
-          fi
+      # NÃO instale deps no código-fonte: CF v2 resolve via requirements.txt no build
+      # Em vez do antigo "Install deps into ./app", removemos essa etapa.
 
-      - name: Build zip from ./app
+      - name: Build zip from repo root
         run: |
           mkdir -p build
-          cd app
-          zip -r ../build/function.zip .
-
+          # cria o zip com arquivos da raiz; ignora itens supérfluos
+          zip -r build/function.zip . \
+            -x "build/*" \
+               ".git/*" \
+               ".github/*" \
+               ".terraform/*" \
+               ".terraform.lock.hcl" \
+               "terraform.tfstate*" \
+               "*.zip"
       - name: Show zip size
         run: du -h build/function.zip
 
@@ -68,20 +78,8 @@ jobs:
 
       - name: Terraform Plan
         if: github.event_name == 'pull_request'
-        run: |
-          terraform plan -input=false \
-            -var="project_id=${{ env.GCP_PROJECT_ID }}"
-        env:
-          TF_VAR_project_id: ${{ env.GCP_PROJECT_ID }}
+        run: terraform plan -input=false
 
       - name: Terraform Apply (develop)
         if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
-        run: |
-          terraform apply -auto-approve -input=false \
-            -var="project_id=${{ env.GCP_PROJECT_ID }}"
-        env:
-          TF_VAR_project_id: ${{ env.GCP_PROJECT_ID }}
-          TF_VAR_region: us-central1
-          TF_VAR_function_name: xlsx-folder-trigger
-          TF_VAR_entry_point: entryPoint
-          TF_VAR_runtime_service_account: cf-runtime@tmabrasil.iam.gserviceaccount.com
+        run: terraform apply -auto-approve -input=false
