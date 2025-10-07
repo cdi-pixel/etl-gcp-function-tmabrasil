@@ -1,6 +1,6 @@
 variable "project_id" {
   type        = string
-  description = "ID do projeto GCP"
+  description = "ID do projeto GCP (ex.: tmabrasil)"
 }
 
 variable "region" {
@@ -23,25 +23,25 @@ variable "runtime" {
 
 variable "entry_point" {
   type        = string
-  description = "Nome da função/handler no código (ex.: entryPoint)"
+  description = "Nome da função/handler no código"
   default     = "entryPoint"
 }
 
 variable "code_bucket_name" {
   type        = string
-  description = "Nome do bucket que armazena o ZIP da função"
+  description = "Bucket que armazena o ZIP da função (código)"
   default     = "cf-src-bucket"
 }
 
 variable "xlsx_bucket_name" {
   type        = string
-  description = "Nome do bucket que recebe os .xlsx e dispara a função"
+  description = "Bucket que recebe os .xlsx e dispara a função"
   default     = "cf-xlsx-bucket"
 }
 
 variable "object_match" {
   type        = string
-  description = "Padrão de objetos para o gatilho (ex.: '*.xlsx' ou 'minha-pasta/*.xlsx')"
+  description = "Padrão do objeto para o gatilho (ex.: '*.xlsx' ou 'minha-pasta/*.xlsx')"
   default     = "*.xlsx"
 }
 
@@ -55,4 +55,16 @@ variable "timeout_seconds" {
   type        = number
   description = "Timeout em segundos"
   default     = 120
+}
+
+variable "manage_runtime_sa_bindings" {
+  type        = bool
+  default     = true
+  description = "Se true, o Terraform garante os papéis na runtime SA (eventarc/run/artifact)."
+}
+
+variable "manage_gcs_pubsub_binding" {
+  type        = bool
+  default     = true
+  description = "Se true, o Terraform cria o binding roles/pubsub.publisher p/ SA do GCS no projeto."
 }

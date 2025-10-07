@@ -7,20 +7,20 @@ terraform {
     }
   }
 
+  # ✅ Backend remoto no bucket tmastates (precisa existir)
   backend "gcs" {
-    bucket = "tmastates"               # <- você disse que vai criar esse bucket p/ state
-    prefix = "state/cf2-xlsx"          # organiza o tfstate dentro do bucket
+    bucket = "tmastates"
+    prefix = "state/cf2-xlsx"
   }
 }
 
-# ---------------- Provider ----------------
+# ---------------- Provider (WIF/ADC - sem credentials file) ----------------
 provider "google" {
   project = var.project_id
   region  = var.region
-  # Nada de credentials aqui (WIF/ADC do GitHub Actions vai cuidar)
 }
 
-# ---------------- Enable APIs (idempotente) ----------------
+# ---------------- Habilitar APIs necessárias ----------------
 resource "google_project_service" "services" {
   for_each = toset([
     "cloudfunctions.googleapis.com",
@@ -32,66 +32,63 @@ resource "google_project_service" "services" {
     "pubsub.googleapis.com",
     "storage.googleapis.com",
   ])
-  project = var.project_id
-  service = each.key
-
-  disable_on_destroy = false
+  project             = var.project_id
+  service             = each.key
+  disable_on_destroy  = false
 }
 
-# ---------------- Service Account de runtime ----------------
-resource "google_service_account" "runtime" {
-  account_id   = "cf-runtime"
-  display_name = "Cloud Functions Runtime"
+# ---------------- Runtime Service Account (já EXISTE) ----------------
+data "google_service_account" "runtime" {
+  project    = var.project_id
+  account_id = "cf-runtime"
 }
 
-# Papéis mínimos para a runtime SA (execução da CF v2 + Eventarc + imagem)
+# Papéis mínimos para a runtime SA (opcionalmente gerenciados pelo TF)
 resource "google_project_iam_member" "runtime_eventarc_receiver" {
+  count   = var.manage_runtime_sa_bindings ? 1 : 0
   project = var.project_id
   role    = "roles/eventarc.eventReceiver"
-  member  = "serviceAccount:${google_service_account.runtime.email}"
+  member  = "serviceAccount:${data.google_service_account.runtime.email}"
 }
 
 resource "google_project_iam_member" "runtime_run_invoker" {
+  count   = var.manage_runtime_sa_bindings ? 1 : 0
   project = var.project_id
   role    = "roles/run.invoker"
-  member  = "serviceAccount:${google_service_account.runtime.email}"
+  member  = "serviceAccount:${data.google_service_account.runtime.email}"
 }
 
 resource "google_project_iam_member" "runtime_artifact_reader" {
+  count   = var.manage_runtime_sa_bindings ? 1 : 0
   project = var.project_id
   role    = "roles/artifactregistry.reader"
-  member  = "serviceAccount:${google_service_account.runtime.email}"
+  member  = "serviceAccount:${data.google_service_account.runtime.email}"
 }
 
 # ---------------- Buckets ----------------
-# 1) Bucket do código da função (onde o ZIP será enviado)
+# 1) Bucket do CÓDIGO (guarda o ZIP)
 resource "google_storage_bucket" "code_bucket" {
   name                        = var.code_bucket_name
   location                    = var.region
   uniform_bucket_level_access = true
 
-  # Não apague sem querer
-  lifecycle {
-    prevent_destroy = true
-  }
+  lifecycle { prevent_destroy = true }
 
   depends_on = [google_project_service.services]
 }
 
-# 2) Bucket de entrada (.xlsx) que dispara a função
+# 2) Bucket dos XLSX (dispara a função)
 resource "google_storage_bucket" "xlsx_bucket" {
   name                        = var.xlsx_bucket_name
   location                    = var.region
   uniform_bucket_level_access = true
 
-  lifecycle {
-    prevent_destroy = true
-  }
+  lifecycle { prevent_destroy = true }
 
   depends_on = [google_project_service.services]
 }
 
-# Objetinho ZIP do código (Terraform envia ./build/function.zip)
+# Objeto ZIP do código (gerado pelo seu CI em build/function.zip)
 resource "google_storage_bucket_object" "function_code" {
   name   = "source-${substr(filemd5("build/function.zip"), 0, 8)}.zip"
   bucket = google_storage_bucket.code_bucket.name
@@ -101,26 +98,26 @@ resource "google_storage_bucket_object" "function_code" {
 }
 
 # ---------------- Eventarc prerequisites ----------------
-# SA interna do Storage (publicador de eventos)
+# SA interna do Storage (publica eventos em Pub/Sub)
 data "google_storage_project_service_account" "gcs_sa" {}
 
-# GCS precisa publicar em Pub/Sub (Eventarc usa isso)
+# Binding necessário p/ Eventarc receber eventos do GCS
 resource "google_project_iam_member" "gcs_pubsub_publisher" {
+  count   = var.manage_gcs_pubsub_binding ? 1 : 0
   project = var.project_id
   role    = "roles/pubsub.publisher"
   member  = "serviceAccount:${data.google_storage_project_service_account.gcs_sa.email_address}"
 }
 
-# ---------------- Cloud Function v2 (event-driven por GCS) ----------------
+# ---------------- Cloud Function v2 (Eventarc - GCS finalized) ----------------
 resource "google_cloudfunctions2_function" "fn" {
   name        = var.function_name
   location    = var.region
-  description = "CF v2: dispara quando .xlsx chega no bucket ${var.xlsx_bucket_name}"
+  description = "Dispara quando .xlsx chega no bucket ${google_storage_bucket.xlsx_bucket.name}"
 
   build_config {
-    runtime     = var.runtime
-    entry_point = var.entry_point
-
+    runtime     = var.runtime            # ex: "python312"
+    entry_point = var.entry_point        # ex: "entryPoint"
     source {
       storage_source {
         bucket = google_storage_bucket.code_bucket.name
@@ -130,9 +127,9 @@ resource "google_cloudfunctions2_function" "fn" {
   }
 
   service_config {
-    service_account_email          = google_service_account.runtime.email
-    available_memory               = var.memory
-    timeout_seconds                = var.timeout_seconds
+    service_account_email          = data.google_service_account.runtime.email
+    available_memory               = var.memory          # ex: "256M"
+    timeout_seconds                = var.timeout_seconds # ex: 120
     ingress_settings               = "ALLOW_INTERNAL_AND_GCLB"
     all_traffic_on_latest_revision = true
   }
@@ -142,16 +139,16 @@ resource "google_cloudfunctions2_function" "fn" {
     trigger_region        = var.region
     event_type            = "google.cloud.storage.object.v1.finalized"
     retry_policy          = "RETRY_POLICY_RETRY"
-    service_account_email = google_service_account.runtime.email
+    service_account_email = data.google_service_account.runtime.email
 
-    # 1) Filtro exato pelo bucket que recebe os .xlsx
+    # 1) Filtro exato do bucket
     event_filters {
       attribute = "bucket"
       value     = google_storage_bucket.xlsx_bucket.name
     }
 
-    # 2) (Opcional) Path pattern para restringir por pasta/arquivo usando SUBJECT
-    # Formato: /projects/_/buckets/<bucket>/objects/<pasta ou padrão>
+    # 2) Path pattern (use SUBJECT) para limitar pasta/extensão
+    # Formato: /projects/_/buckets/<bucket>/objects/<padrão>
     event_filters {
       attribute = "subject"
       operator  = "match-path-pattern"
@@ -159,14 +156,16 @@ resource "google_cloudfunctions2_function" "fn" {
     }
   }
 
-  # Garante ordem: APIs + buckets + publisher antes da função/trigger
-  depends_on = [
+  # Garante ordem: APIs + buckets + (bindings opcionais) antes da função/trigger
+  depends_on = concat([
     google_project_service.services,
     google_storage_bucket.code_bucket,
-    google_storage_bucket.xlsx_bucket,
+    google_storage_bucket.xlsx_bucket
+  ], var.manage_runtime_sa_bindings ? [
     google_project_iam_member.runtime_eventarc_receiver,
     google_project_iam_member.runtime_run_invoker,
-    google_project_iam_member.runtime_artifact_reader,
+    google_project_iam_member.runtime_artifact_reader
+  ] : [], var.manage_gcs_pubsub_binding ? [
     google_project_iam_member.gcs_pubsub_publisher
-  ]
+  ] : [])
 }
