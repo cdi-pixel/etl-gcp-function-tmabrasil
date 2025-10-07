@@ -26,7 +26,8 @@ jobs:
       TF_VAR_function_name: xlsx-folder-trigger
       TF_VAR_entry_point: entryPoint
       TF_VAR_runtime_service_account: cf-runtime@tmabrasil.iam.gserviceaccount.com
-
+      TF_VAR_trigger_bucket_name: tmabrasil-function-bucket
+      TF_VAR_object_match: arquivos/*.xlsx
     steps:
       - name: Checkout
         uses: actions/checkout@v4
