@@ -7,10 +7,12 @@ terraform {
   }
 }
 
+# DICA: não defina credentials aqui. Deixe o ADC do GitHub Actions assumir.
 provider "google" {
-  project     = var.project_id
-  region      = var.region
-  credentials = file(var.credentials_file)  # <- usa o sa.json
+  project = var.project_id
+  region  = var.region
+  # opcional: se você quiser forçar uma SA diferente daquela autenticada no WIF:
+  # impersonate_service_account = var.impersonate_sa # ex: "cf-runtime@tmabrasil.iam.gserviceaccount.com"
 }
 
 # Bucket p/ código
@@ -21,8 +23,7 @@ resource "google_storage_bucket" "function_bucket" {
   force_destroy               = true
 }
 
-# Usa o ZIP gerado no workflow
-# Dica: usar nome com hash força rebuild quando o zip muda
+# Artefato (força atualização quando o zip muda)
 resource "google_storage_bucket_object" "function_code" {
   name   = "source-${substr(filemd5("build/function.zip"), 0, 8)}.zip"
   bucket = google_storage_bucket.function_bucket.name
@@ -47,9 +48,11 @@ resource "google_cloudfunctions2_function" "fn" {
   }
 
   service_config {
-    available_memory   = "256M"
-    timeout_seconds    = 60
-    max_instance_count = 3
-    ingress_settings   = "ALLOW_ALL"
+    available_memory        = "256M"
+    timeout_seconds         = 60
+    max_instance_count      = 3
+    ingress_settings        = "ALLOW_ALL"
+    # recomendo fixar a SA de runtime:
+    service_account_email   = var.runtime_service_account # ex: "cf-runtime@tmabrasil.iam.gserviceaccount.com"
   }
 }

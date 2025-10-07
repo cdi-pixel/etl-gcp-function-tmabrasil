@@ -2,7 +2,7 @@ name: Deploy Cloud Function (zip app + Terraform)
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "develop" ]
   pull_request:
     paths:
       - "app/**"
@@ -11,7 +11,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write   # necessário apenas se usar WIF (bloco comentado abaixo)
+  id-token: write   # necessário p/ WIF (OIDC)
 
 jobs:
   deploy:
@@ -19,7 +19,6 @@ jobs:
 
     env:
       GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
-      GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
 
     steps:
       - name: Checkout
@@ -46,20 +45,20 @@ jobs:
       - name: Show zip size
         run: du -h build/function.zip
 
-      # --- AUTENTICAÇÃO (escolha 1 dos métodos) ---
+      # --------- AUTENTICAÇÃO VIA WIF (sem chave JSON) ---------
+      - name: Auth via Workload Identity Federation (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          # Ex.: projects/70919570240/locations/global/workloadIdentityPools/github-pool-access/providers/github-provider
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          # Ex.: gh-deployer@tmabrasil.iam.gserviceaccount.com
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          export_environment_variables: true  # expõe ADC para Terraform/gcloud
 
-      # 1) Service Account JSON (seu caso atual)
-      - name: Write SA key file
-        if: env.GCP_SA_KEY != ''
-        run: echo "$GCP_SA_KEY" > sa.json
-
-      # 2) (Opcional) WIF OIDC - se quiser trocar futuramente:
-      # - name: Auth via WIF
-      #   uses: google-github-actions/auth@v2
-      #   with:
-      #     token_format: 'access_token'
-      #     workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
-      #     service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+      - name: Setup gcloud (opcional, útil p/ debug)
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
@@ -71,12 +70,14 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           terraform plan -input=false \
-            -var="project_id=${{ env.GCP_PROJECT_ID }}" \
-            -var="credentials_file=sa.json"
+            -var="project_id=${{ env.GCP_PROJECT_ID }}"
+        env:
+          TF_VAR_project_id: ${{ env.GCP_PROJECT_ID }}
 
-      - name: Terraform Apply (main)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      - name: Terraform Apply (develop)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/develop'
         run: |
           terraform apply -auto-approve -input=false \
-            -var="project_id=${{ env.GCP_PROJECT_ID }}" \
-            -var="credentials_file=sa.json"
+            -var="project_id=${{ env.GCP_PROJECT_ID }}"
+        env:
+          TF_VAR_project_id: ${{ env.GCP_PROJECT_ID }}
