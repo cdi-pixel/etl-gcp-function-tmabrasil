@@ -28,6 +28,9 @@ jobs:
       TF_VAR_runtime_service_account: cf-runtime@tmabrasil.iam.gserviceaccount.com
       TF_VAR_trigger_bucket_name: tmabrasil-function-bucket
       TF_VAR_object_match: arquivos/*.xlsx
+      TF_VAR_manage_runtime_sa_bindings: false
+      TF_VAR_manage_gcs_pubsub_binding: false
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
