@@ -135,26 +135,19 @@ resource "google_cloudfunctions2_function" "fn" {
   }
 
   # 🔔 Gatilho via Eventarc (GCS finalized)
-  event_trigger {
-    trigger_region        = var.region
-    event_type            = "google.cloud.storage.object.v1.finalized"
-    retry_policy          = "RETRY_POLICY_RETRY"
-    service_account_email = data.google_service_account.runtime.email
+event_trigger {
+  trigger_region        = var.region
+  event_type            = "google.cloud.storage.object.v1.finalized"
+  retry_policy          = "RETRY_POLICY_RETRY"
+  service_account_email = data.google_service_account.runtime.email
 
-    # 1) Filtro exato do bucket
-    event_filters {
-      attribute = "bucket"
-      value     = google_storage_bucket.xlsx_bucket.name
-    }
-
-    # 2) Path pattern (use SUBJECT) para limitar pasta/extensão
-    # Formato: /projects/_/buckets/<bucket>/objects/<padrão>
-    event_filters {
-      attribute = "subject"
-      operator  = "match-path-pattern"
-      value     = "/projects/_/buckets/${google_storage_bucket.xlsx_bucket.name}/objects/${var.object_match}"
-    }
+  # filtro do bucket (único suportado pelo evento direto)
+  event_filters {
+    attribute = "bucket"
+    value     = google_storage_bucket.xlsx_bucket.name
   }
+}
+
 
   # Garante ordem: APIs + buckets + (bindings opcionais) antes da função/trigger
   depends_on = [
