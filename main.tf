@@ -157,15 +157,10 @@ resource "google_cloudfunctions2_function" "fn" {
   }
 
   # Garante ordem: APIs + buckets + (bindings opcionais) antes da função/trigger
-  depends_on = concat([
+  depends_on = [
     google_project_service.services,
     google_storage_bucket.code_bucket,
     google_storage_bucket.xlsx_bucket
-  ], var.manage_runtime_sa_bindings ? [
-    google_project_iam_member.runtime_eventarc_receiver,
-    google_project_iam_member.runtime_run_invoker,
-    google_project_iam_member.runtime_artifact_reader
-  ] : [], var.manage_gcs_pubsub_binding ? [
     google_project_iam_member.gcs_pubsub_publisher
-  ] : [])
+  ]
 }
