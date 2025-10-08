@@ -68,3 +68,8 @@ variable "manage_gcs_pubsub_binding" {
   default     = true
   description = "Se true, o Terraform cria o binding roles/pubsub.publisher p/ SA do GCS no projeto."
 }
+
+variable "bq_dataset" {
+  type        = string
+  description = "Dataset do BigQuery onde será criada a tabela base_geral"
+}

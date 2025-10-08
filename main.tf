@@ -132,7 +132,14 @@ resource "google_cloudfunctions2_function" "fn" {
     timeout_seconds                = var.timeout_seconds # ex: 120
     ingress_settings               = "ALLOW_INTERNAL_AND_GCLB"
     all_traffic_on_latest_revision = true
+      environment_variables = {
+    BQ_DATASET = var.bq_dataset  # <- adicione essa var no variables.tf
   }
+  }
+
+
+
+
 
   # 🔔 Gatilho via Eventarc (GCS finalized)
 event_trigger {

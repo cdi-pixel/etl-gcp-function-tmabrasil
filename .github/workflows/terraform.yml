@@ -30,6 +30,8 @@ jobs:
       TF_VAR_object_match: arquivos/*.xlsx
       TF_VAR_manage_runtime_sa_bindings: false
       TF_VAR_manage_gcs_pubsub_binding: false
+      TF_VAR_bq_dataset: tmabrasil
+
 
     steps:
       - name: Checkout
