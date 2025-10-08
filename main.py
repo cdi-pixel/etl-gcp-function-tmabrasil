@@ -12,8 +12,8 @@ from google.cloud import storage, bigquery
 from google.api_core.exceptions import NotFound
 
 TABLE_NAME = "base_geral"
-BQ_DATASET = os.environ.get("BQ_DATASET")
-PROJECT_ID = os.environ.get("GCP_PROJECT") or os.environ.get("GOOGLE_CLOUD_PROJECT")
+BQ_DATASET = "tmabrasil"
+PROJECT_ID = "tmabrasil"
 
 
 # --------- helpers ---------
