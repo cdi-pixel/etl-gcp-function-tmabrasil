@@ -4,7 +4,6 @@ import io
 import json
 import time
 import tempfile
-from datetime import datetime
 from typing import List
 
 import pandas as pd
@@ -16,7 +15,7 @@ from google.api_core.exceptions import NotFound
 TABLE_NAME_BASE_GERAL = "base_geral"
 TABLE_NAME_QGC        = "qgc"
 
-# Você disse que isso funcionou bem hardcoded:
+# hardcoded conforme seu exemplo anterior
 BQ_DATASET = "tmabrasil"   # dataset do BigQuery
 PROJECT_ID = "tmabrasil"   # project id
 
@@ -84,7 +83,7 @@ def process_base_geral(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_BASE_GERAL}"
     print(f"[base_geral] FULL LOAD → {table_id} a partir de gs://{gcs_bucket}/{gcs_object}")
 
-    # baixa arquivo
+    # baixa
     storage_client = storage.Client()
     blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
     xlsx_path = os.path.join(tempfile.gettempdir(), "base_geral.xlsx")
@@ -117,29 +116,41 @@ def process_base_geral(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     table = bq.get_table(table_id)
     print(f"[base_geral] FULL LOAD concluído: {table.num_rows} linhas")
 
-# ===================== FLUXO 2: QGC_<EMPRESA>.xlsx (UPSERT) =====================
-QGC_COLUMNS = ["grupo","empresa","fonte","classe","subclasse","credor","moeda","valor","data"]
+# ===================== FLUXO 2: qualquer outro .xlsx (INCREMENTAL QGC) =====================
+# colunas base esperadas no QGC
+QGC_BASE_COLUMNS  = ["grupo","empresa","fonte","classe","subclasse","credor","moeda","valor","data"]
+# adicionamos a coluna de controle por arquivo
+QGC_FINAL_COLUMNS = QGC_BASE_COLUMNS + ["nomearquivo"]
 
 def ensure_qgc_table(bq: bigquery.Client):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
     try:
-        bq.get_table(table_id)
+        table = bq.get_table(table_id)
+        # garante que 'nomearquivo' exista
+        existing = {f.name for f in table.schema}
+        to_add = [c for c in QGC_FINAL_COLUMNS if c not in existing]
+        if to_add:
+            new_schema = list(table.schema) + [bigquery.SchemaField(c, "STRING") for c in to_add]
+            table.schema = new_schema
+            bq.update_table(table, ["schema"])
+            print(f"[qgc] Schema atualizado com colunas: {to_add}")
         return
     except NotFound:
         print("[qgc] Tabela não existe. Criando...")
-        schema = build_string_schema(QGC_COLUMNS)
+        schema = build_string_schema(QGC_FINAL_COLUMNS)
         table = bigquery.Table(table_id, schema=schema)
         bq.create_table(table)
         print("[qgc] Tabela criada.")
 
-def process_qgc_upsert(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
+def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     final_table = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
-    print(f"[qgc] UPSERT → {final_table} a partir de gs://{gcs_bucket}/{gcs_object}")
+    base_name   = os.path.basename(gcs_object)
+    print(f"[qgc] INCREMENTAL (por arquivo) → {final_table} a partir de {base_name}")
 
-    # baixa arquivo
+    # baixa
     storage_client = storage.Client()
     blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
-    xlsx_path = os.path.join(tempfile.gettempdir(), "qgc.xlsx")
+    xlsx_path = os.path.join(tempfile.gettempdir(), f"qgc_{int(time.time())}.xlsx")
     blob.download_to_filename(xlsx_path)
 
     # lê e normaliza headers
@@ -147,17 +158,20 @@ def process_qgc_upsert(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     df.dropna(how="all", inplace=True)
     df = normalize_headers_df(df)
 
-    # garante colunas esperadas (as que não existirem entram como None)
-    for col in QGC_COLUMNS:
+    # garante colunas base; extras são ignoradas
+    for col in QGC_BASE_COLUMNS:
         if col not in df.columns:
             df[col] = None
 
-    # mantém apenas as colunas esperadas e na ordem
-    df = df[QGC_COLUMNS]
+    # seleciona e ordena as colunas base
+    df = df[QGC_BASE_COLUMNS]
 
     # converte tudo para STRING/None
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
+
+    # adiciona a coluna nomearquivo
+    df["nomearquivo"] = base_name
 
     # staging JSONL
     ts = int(time.time())
@@ -169,8 +183,8 @@ def process_qgc_upsert(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     ensure_qgc_table(bq)
 
     # carrega staging (WRITE_TRUNCATE)
-    staging_schema = build_string_schema(QGC_COLUMNS)
-    job_config = bigquery.LoadJobConfig(
+    staging_schema = build_string_schema(QGC_FINAL_COLUMNS)
+    load_cfg = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
@@ -178,26 +192,24 @@ def process_qgc_upsert(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
         autodetect=False,
     )
     with open(jsonl_path, "rb") as f:
-        load_job = bq.load_table_from_file(f, staging_table, job_config=job_config)
+        load_job = bq.load_table_from_file(f, staging_table, job_config=load_cfg)
     load_job.result()
     print(f"[qgc] Staging carregado: {staging_table}")
 
-    # MERGE: insere somente registros ainda não existentes (match por TODAS as colunas)
-    cols = QGC_COLUMNS
-    on_clause = " AND ".join([f"T.{c} = S.{c}" for c in cols])
-    insert_cols = ", ".join(cols)
-    insert_vals = ", ".join([f"S.{c}" for c in cols])
+    # regra: se o mesmo arquivo chegar de novo, substitui tudo daquele arquivo
+    # => DELETE pelo nomearquivo, depois INSERT de todos os registros do staging
+    params = [bigquery.ScalarQueryParameter("file", "STRING", base_name)]
+    delete_job = bq.query(
+        f"DELETE FROM `{final_table}` WHERE nomearquivo = @file",
+        job_config=bigquery.QueryJobConfig(query_parameters=params),
+    )
+    delete_job.result()
+    print(f"[qgc] Registros antigos removidos para nomearquivo={base_name}")
 
-    merge_sql = f"""
-    MERGE `{final_table}` T
-    USING `{staging_table}` S
-    ON {on_clause}
-    WHEN NOT MATCHED THEN
-      INSERT ({insert_cols}) VALUES ({insert_vals})
-    """
-    qjob = bq.query(merge_sql)
-    qjob.result()
-    print("[qgc] MERGE concluído.")
+    insert_cols = ", ".join(QGC_FINAL_COLUMNS)
+    insert_sql  = f"INSERT INTO `{final_table}` ({insert_cols}) SELECT {insert_cols} FROM `{staging_table}`"
+    bq.query(insert_sql).result()
+    print("[qgc] Insert concluído.")
 
     # limpa staging
     try:
@@ -214,19 +226,18 @@ def entryPoint(data, context):
         print("Evento sem bucket/name. Ignorando.")
         return
 
-    base = os.path.basename(name)
+    base = os.path.basename(name).lower()
 
     # Regra 1: base_geral.xlsx -> FULL LOAD
-    if base.lower() == "base_geral.xlsx":
+    if base == "base_geral.xlsx":
         bq = bigquery.Client()
         process_base_geral(bq, bucket, name)
         return
 
-    # Regra 2: QGC_<EMPRESA>.xlsx -> UPSERT
-    # Aceita qualquer prefixo/pasta; só valida o padrão do nome do arquivo
-    if re.match(r"(?i)^QGC_.*\.xlsx$", base):
+    # Regra 2: qualquer outro .xlsx -> INCREMENTAL QGC com 'nomearquivo'
+    if base.endswith(".xlsx"):
         bq = bigquery.Client()
-        process_qgc_upsert(bq, bucket, name)
+        process_qgc_incremental(bq, bucket, name)
         return
 
     print(f"Ignorando objeto sem regra: {name}")
