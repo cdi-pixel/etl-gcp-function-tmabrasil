@@ -5,6 +5,7 @@ import json
 import time
 import tempfile
 from typing import List
+from datetime import datetime
 
 import pandas as pd
 from unidecode import unidecode
@@ -12,12 +13,13 @@ from google.cloud import storage, bigquery
 from google.api_core.exceptions import NotFound
 
 # ===================== CONFIG =====================
-TABLE_NAME_BASE_GERAL = "base_geral"
-TABLE_NAME_QGC        = "qgc"
+TABLE_NAME_BASE_GERAL   = "base_geral"
+TABLE_NAME_QGC          = "qgc"
+STATUS_TABLE_NAME       = "status_implantacao"   # <- tabela de status
 
-# hardcoded conforme seu exemplo anterior
-BQ_DATASET = "tmabrasil"   # dataset do BigQuery
-PROJECT_ID = "tmabrasil"   # project id
+# hardcoded conforme seu ambiente
+BQ_DATASET = "tmabrasil"
+PROJECT_ID = "tmabrasil"
 
 # ===================== HELPERS =====================
 def normalize_header(h: str) -> str:
@@ -78,6 +80,38 @@ def df_to_jsonl(df: pd.DataFrame, jsonl_path: str):
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
     return jsonl_path
 
+# -------- status table (logs) --------
+def ensure_status_table(bq: bigquery.Client):
+    table_id = f"{PROJECT_ID}.{BQ_DATASET}.{STATUS_TABLE_NAME}"
+    try:
+        bq.get_table(table_id)
+        return
+    except NotFound:
+        schema = [
+            bigquery.SchemaField("data_envio", "TIMESTAMP"),
+            bigquery.SchemaField("nomearquivo", "STRING"),
+            bigquery.SchemaField("status", "STRING"),
+            bigquery.SchemaField("mensagem", "STRING"),
+        ]
+        table = bigquery.Table(table_id, schema=schema)
+        bq.create_table(table)
+        print("[status] Tabela de status criada.")
+
+def log_status(bq: bigquery.Client, nome_arquivo: str, status: str, mensagem: str):
+    """Insere 1 linha na tabela de status. Não quebra o fluxo se falhar."""
+    try:
+        table_id = f"{PROJECT_ID}.{BQ_DATASET}.{STATUS_TABLE_NAME}"
+        rows = [{
+            "data_envio": datetime.utcnow().isoformat(" "),
+            "nomearquivo": nome_arquivo,
+            "status": status[:50],
+            "mensagem": (mensagem or "")[:1500],
+        }]
+        bq.insert_rows_json(table_id, rows)
+        print(f"[status] {status} | {nome_arquivo} | {mensagem}")
+    except Exception as e:
+        print(f"[status] Falha ao registrar status: {e}")
+
 # ===================== FLUXO 1: base_geral.xlsx (FULL LOAD) =====================
 def process_base_geral(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_BASE_GERAL}"
@@ -96,11 +130,10 @@ def process_base_geral(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
-    # JSONL + LOAD (WRITE_TRUNCATE)
+    # JSONL + LOAD (WRITE_TRUNCATE, CREATE_IF_NEEDED cria a tabela se faltar)
     jsonl_path = os.path.join(tempfile.gettempdir(), "base_geral.jsonl")
     df_to_jsonl(df, jsonl_path)
 
-    ensure_dataset(bq, BQ_DATASET)
     schema = build_string_schema(list(df.columns))
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
@@ -117,9 +150,7 @@ def process_base_geral(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     print(f"[base_geral] FULL LOAD concluído: {table.num_rows} linhas")
 
 # ===================== FLUXO 2: qualquer outro .xlsx (INCREMENTAL QGC) =====================
-# colunas base esperadas no QGC
 QGC_BASE_COLUMNS  = ["grupo","empresa","fonte","classe","subclasse","credor","moeda","valor","data"]
-# adicionamos a coluna de controle por arquivo
 QGC_FINAL_COLUMNS = QGC_BASE_COLUMNS + ["nomearquivo"]
 
 def ensure_qgc_table(bq: bigquery.Client):
@@ -170,7 +201,7 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
-    # adiciona a coluna nomearquivo
+    # adiciona a coluna de controle por arquivo
     df["nomearquivo"] = base_name
 
     # staging JSONL
@@ -179,7 +210,6 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     jsonl_path = os.path.join(tempfile.gettempdir(), f"qgc_{ts}.jsonl")
     df_to_jsonl(df, jsonl_path)
 
-    ensure_dataset(bq, BQ_DATASET)
     ensure_qgc_table(bq)
 
     # carrega staging (WRITE_TRUNCATE)
@@ -196,14 +226,12 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     load_job.result()
     print(f"[qgc] Staging carregado: {staging_table}")
 
-    # regra: se o mesmo arquivo chegar de novo, substitui tudo daquele arquivo
-    # => DELETE pelo nomearquivo, depois INSERT de todos os registros do staging
+    # substitui todos os registros daquele arquivo (idempotência por nomearquivo)
     params = [bigquery.ScalarQueryParameter("file", "STRING", base_name)]
-    delete_job = bq.query(
+    bq.query(
         f"DELETE FROM `{final_table}` WHERE nomearquivo = @file",
         job_config=bigquery.QueryJobConfig(query_parameters=params),
-    )
-    delete_job.result()
+    ).result()
     print(f"[qgc] Registros antigos removidos para nomearquivo={base_name}")
 
     insert_cols = ", ".join(QGC_FINAL_COLUMNS)
@@ -226,18 +254,32 @@ def entryPoint(data, context):
         print("Evento sem bucket/name. Ignorando.")
         return
 
-    base = os.path.basename(name).lower()
+    base = os.path.basename(name)
+    bq = bigquery.Client()
+
+    # garante dataset e tabela de status no início (para sempre conseguir logar)
+    ensure_dataset(bq, BQ_DATASET)
+    ensure_status_table(bq)
 
     # Regra 1: base_geral.xlsx -> FULL LOAD
-    if base == "base_geral.xlsx":
-        bq = bigquery.Client()
-        process_base_geral(bq, bucket, name)
+    if base.lower() == "base_geral.xlsx":
+        try:
+            process_base_geral(bq, bucket, name)
+            log_status(bq, base, "SUCESSO", "implementado com sucesso")
+        except Exception as e:
+            # ❌ sem raise: não gera retry
+            log_status(bq, base, "ERRO", str(e))
         return
 
-    # Regra 2: qualquer outro .xlsx -> INCREMENTAL QGC com 'nomearquivo'
-    if base.endswith(".xlsx"):
-        bq = bigquery.Client()
-        process_qgc_incremental(bq, bucket, name)
+    # Regra 2: qualquer outro .xlsx -> INCREMENTAL QGC
+    if base.lower().endswith(".xlsx"):
+        try:
+            process_qgc_incremental(bq, bucket, name)
+            log_status(bq, base, "SUCESSO", "implementado com sucesso")
+        except Exception as e:
+            # ❌ sem raise: não gera retry
+            log_status(bq, base, "ERRO", str(e))
         return
 
+    # sem regra
     print(f"Ignorando objeto sem regra: {name}")
