@@ -48,7 +48,7 @@ variable "object_match" {
 variable "memory" {
   type        = string
   description = "Memória de execução (ex.: 256M, 512M, 1Gi)"
-  default     = "1Gi"
+  default     = "512Mi"
 }
 
 variable "timeout_seconds" {
@@ -73,3 +73,4 @@ variable "bq_dataset" {
   type        = string
   description = "Dataset do BigQuery onde será criada a tabela base_geral"
 }
+
