@@ -48,13 +48,13 @@ variable "object_match" {
 variable "memory" {
   type        = string
   description = "Memória de execução (ex.: 256M, 512M, 1Gi)"
-  default     = "256M"
+  default     = "1Gi"
 }
 
 variable "timeout_seconds" {
   type        = number
   description = "Timeout em segundos"
-  default     = 120
+  default     = 1200
 }
 
 variable "manage_runtime_sa_bindings" {

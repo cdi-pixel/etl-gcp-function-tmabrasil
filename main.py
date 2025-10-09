@@ -1,6 +1,4 @@
 import os
-import re
-import io
 import json
 import time
 import tempfile
@@ -8,7 +6,6 @@ from typing import List
 from datetime import datetime
 
 import pandas as pd
-from unidecode import unidecode
 from google.cloud import storage, bigquery
 from google.api_core.exceptions import NotFound
 
@@ -67,6 +64,12 @@ BASE_FIXED_COLUMNS = [
     "processo_fisico_ou_digital",
     "revisao",
     "status_do_processo",
+]
+
+# Colunas FIXAS do QGC (STRING)
+QGC_COLUMNS = [
+    "GRUPO", "EMPRESA", "FONTE", "CLASSE", "SUBCLASSE", "CREDOR",
+    "MOEDA", "VALOR", "DATA", "NOMEARQUIVO", "DATAIMPLEMENTACAO"
 ]
 
 # ===================== HELPERS =====================
@@ -147,32 +150,27 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     xlsx_path = os.path.join(tempfile.gettempdir(), "base_fixed.xlsx")
     blob.download_to_filename(xlsx_path)
 
-    # 1) lê SEM header (header=None)
+    # lê SEM header e descarta a primeira linha (header humano)
     df = pd.read_excel(xlsx_path, header=None)
-    # 2) remove linhas totalmente vazias
     df.dropna(how="all", inplace=True)
     df.reset_index(drop=True, inplace=True)
-    # 3) descarta a primeira linha (header humano)
     if len(df) >= 1:
         df = df.iloc[1:].reset_index(drop=True)
 
-    # 4) força o número de colunas para o tamanho fixo
+    # força número e nomes das colunas
     need_cols = len(BASE_FIXED_COLUMNS)
-    # se tem menos colunas, completa com None
     if df.shape[1] < need_cols:
         for _ in range(need_cols - df.shape[1]):
             df[df.shape[1]] = None
-    # se tem mais colunas, corta
     if df.shape[1] > need_cols:
         df = df.iloc[:, :need_cols]
-    # aplica os nomes fixos
     df.columns = BASE_FIXED_COLUMNS
 
-    # 5) tudo STRING/None
+    # tudo STRING
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
-    # 6) JSONL + LOAD (WRITE_TRUNCATE)
+    # JSONL + LOAD
     jsonl_path = os.path.join(tempfile.gettempdir(), "base_fixed.jsonl")
     df_to_jsonl(df, jsonl_path)
 
@@ -191,16 +189,13 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     table = bq.get_table(table_id)
     print(f"[base_fixed] FULL LOAD concluído: {table.num_rows} linhas")
 
-# =========== INCREMENTAL: QGC (nomearquivo + data_inclusao, substitui por arquivo) ===========
-QGC_BASE_COLUMNS  = ["grupo","empresa","fonte","classe","subclasse","credor","moeda","valor","data"]
-QGC_FINAL_COLUMNS = QGC_BASE_COLUMNS + ["nomearquivo", "data_inclusao"]
-
+# =========== INCREMENTAL: QGC (11 colunas UPPERCASE, substitui por arquivo) ===========
 def ensure_qgc_table(bq: bigquery.Client):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
     try:
         table = bq.get_table(table_id)
         existing = {f.name for f in table.schema}
-        to_add = [c for c in QGC_FINAL_COLUMNS if c not in existing]
+        to_add = [c for c in QGC_COLUMNS if c not in existing]
         if to_add:
             new_schema = list(table.schema) + [bigquery.SchemaField(c, "STRING") for c in to_add]
             table.schema = new_schema
@@ -209,7 +204,7 @@ def ensure_qgc_table(bq: bigquery.Client):
         return
     except NotFound:
         print("[qgc] Tabela não existe. Criando...")
-        schema = build_string_schema(QGC_FINAL_COLUMNS)
+        schema = build_string_schema(QGC_COLUMNS)
         table = bigquery.Table(table_id, schema=schema)
         bq.create_table(table)
         print("[qgc] Tabela criada.")
@@ -225,21 +220,35 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     xlsx_path = os.path.join(tempfile.gettempdir(), f"qgc_{int(time.time())}.xlsx")
     blob.download_to_filename(xlsx_path)
 
-    # aqui mantemos leitura comum com header na 1ª linha (se preferir, dá pra fazer como no base_fixed)
-    df = pd.read_excel(xlsx_path)
+    # lê SEM header e descarta a primeira linha (header humano)
+    df = pd.read_excel(xlsx_path, header=None)
     df.dropna(how="all", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    if len(df) >= 1:
+        df = df.iloc[1:].reset_index(drop=True)
 
-    # garante colunas base (cria faltantes), depois ordena e corta/extrai só elas
-    for col in QGC_BASE_COLUMNS:
+    # força exatamente as 9 primeiras colunas de dados
+    base_cols_cnt = 9  # GRUPO..DATA
+    if df.shape[1] < base_cols_cnt:
+        for _ in range(base_cols_cnt - df.shape[1]):
+            df[df.shape[1]] = None
+    if df.shape[1] > base_cols_cnt:
+        df = df.iloc[:, :base_cols_cnt]
+
+    # adiciona colunas de controle (nome do arquivo e timestamp)
+    df["NOMEARQUIVO"]       = base_name
+    df["DATAIMPLEMENTACAO"] = now_str
+
+    # reordena para exatamente QGC_COLUMNS (11 colunas)
+    # cria faltantes caso algo tenha faltado
+    for col in QGC_COLUMNS:
         if col not in df.columns:
             df[col] = None
-    df = df[QGC_BASE_COLUMNS]
+    df = df[QGC_COLUMNS]
 
+    # tudo STRING
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
-
-    df["nomearquivo"]   = base_name
-    df["data_inclusao"] = now_str
 
     # staging
     ts = int(time.time())
@@ -249,7 +258,7 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
 
     ensure_qgc_table(bq)
 
-    staging_schema = build_string_schema(QGC_FINAL_COLUMNS)
+    staging_schema = build_string_schema(QGC_COLUMNS)
     load_cfg = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
@@ -262,15 +271,15 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     load_job.result()
     print(f"[qgc] Staging carregado: {staging_table}")
 
-    # substitui todo o conteúdo do mesmo arquivo
+    # substitui todo o conteúdo do mesmo arquivo (idempotência por NOMEARQUIVO)
     params = [bigquery.ScalarQueryParameter("file", "STRING", base_name)]
     bq.query(
-        f"DELETE FROM `{final_table}` WHERE nomearquivo = @file",
+        f"DELETE FROM `{final_table}` WHERE NOMEARQUIVO = @file",
         job_config=bigquery.QueryJobConfig(query_parameters=params),
     ).result()
-    print(f"[qgc] Registros antigos removidos para nomearquivo={base_name}")
+    print(f"[qgc] Registros antigos removidos para NOMEARQUIVO={base_name}")
 
-    insert_cols = ", ".join(QGC_FINAL_COLUMNS)
+    insert_cols = ", ".join(QGC_COLUMNS)
     insert_sql  = f"INSERT INTO `{final_table}` ({insert_cols}) SELECT {insert_cols} FROM `{staging_table}`"
     bq.query(insert_sql).result()
     print("[qgc] Insert concluído.")
@@ -304,7 +313,7 @@ def entryPoint(data, context):
             log_status(bq, base, "ERRO", str(e))
         return
 
-    # qualquer outro .xlsx -> QGC incremental
+    # qualquer outro .xlsx -> QGC incremental (11 colunas fixas em UPPERCASE)
     if base.lower().endswith(".xlsx"):
         try:
             process_qgc_incremental(bq, bucket, name)
