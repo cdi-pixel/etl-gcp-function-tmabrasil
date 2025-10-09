@@ -15,25 +15,64 @@ from google.api_core.exceptions import NotFound
 # ===================== CONFIG =====================
 TABLE_NAME_BASE_GERAL   = "base_geral"
 TABLE_NAME_QGC          = "qgc"
-STATUS_TABLE_NAME       = "status_implantacao"   # <- tabela de status
+STATUS_TABLE_NAME       = "status_implantacao"
 
-# hardcoded conforme seu ambiente
+# seu ambiente
 BQ_DATASET = "tmabrasil"
 PROJECT_ID = "tmabrasil"
 
-# ===================== HELPERS =====================
-def normalize_header(h: str) -> str:
-    s = unidecode(str(h)).lower().strip()
-    s = re.sub(r"[^\w]+", "_", s)
-    s = re.sub(r"_+", "_", s).strip("_")
-    if re.match(r"^\d", s):
-        s = "_" + s
-    return s or "col"
+# Colunas FIXAS (100% STRING) para base_legal/base_geral
+BASE_FIXED_COLUMNS = [
+    "empresa",
+    "id",
+    "sem_arquivos_digitais",
+    "com_qgc_feito",
+    "tipo_de_sociedade",
+    "capital_aberto",
+    "setor_de_atuacao",
+    "subsetor",
+    "estado",
+    "cidade",
+    "estado2",
+    "vara",
+    "vara_especializada",
+    "pericia_previa",
+    "empresa_pericia_previa",
+    "advogado",
+    "consultoria_assessoria_financeira_reestruturacao",
+    "substituicao_do_aj",
+    "destituicao_do_aj",
+    "_1o_administrador_judicial",
+    "_2o_administrador_judicial",
+    "_3o_administrador_judicial",
+    "tipo",
+    "consolidacao_substancial",
+    "tamanho_aproximado_da_rj_valor_da_divida_declarado_nos_documentos_iniciais",
+    "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o",
+    "modalidade_de_remuneracao_do_aj",
+    "remuneracao_aj_do_passivo",
+    "remuneracao_aj_valor_total",
+    "remuneracao_aj_r_parcelas_mensais_honorarios_provisorios",
+    "remuneracao_aj_r_parcelas_mensais_honorarios_definitivos",
+    "quantidade_de_assembleias_para_aprovacao",
+    "houve_apresentacao_de_plano_pelos_credores",
+    "n_processo",
+    "link_processo",
+    "link_logo",
+    "link_ri_outros",
+    "termos",
+    "informacoes",
+    "data_de_manipulacao",
+    "segredo_de_justica",
+    "processo_fisico_ou_digital",
+    "revisao",
+    "status_do_processo",
+]
 
+# ===================== HELPERS =====================
 def to_str_or_none(v):
     if v is None:
         return None
-    # pandas NaN/NaT
     try:
         import math
         if isinstance(v, float) and math.isnan(v):
@@ -60,19 +99,6 @@ def ensure_dataset(bq: bigquery.Client, dataset_id: str):
 def build_string_schema(cols: List[str]):
     return [bigquery.SchemaField(c, "STRING") for c in cols]
 
-def normalize_headers_df(df: pd.DataFrame) -> pd.DataFrame:
-    new_cols, used = [], {}
-    for col in df.columns:
-        norm = normalize_header(col)
-        if norm in used:
-            used[norm] += 1
-            norm = f"{norm}_{used[norm]}"
-        else:
-            used[norm] = 1
-        new_cols.append(norm)
-    df.columns = new_cols
-    return df
-
 def df_to_jsonl(df: pd.DataFrame, jsonl_path: str):
     with open(jsonl_path, "w", encoding="utf-8") as f:
         for _, row in df.iterrows():
@@ -98,7 +124,6 @@ def ensure_status_table(bq: bigquery.Client):
         print("[status] Tabela de status criada.")
 
 def log_status(bq: bigquery.Client, nome_arquivo: str, status: str, mensagem: str):
-    """Insere 1 linha na tabela de status. Não quebra o fluxo se falhar."""
     try:
         table_id = f"{PROJECT_ID}.{BQ_DATASET}.{STATUS_TABLE_NAME}"
         rows = [{
@@ -112,29 +137,46 @@ def log_status(bq: bigquery.Client, nome_arquivo: str, status: str, mensagem: st
     except Exception as e:
         print(f"[status] Falha ao registrar status: {e}")
 
-# ===================== FLUXO 1: base_geral.xlsx (FULL LOAD) =====================
-def process_base_geral(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
+# ====== FULL LOAD: base_legal/base_geral (ignora header e usa colunas fixas) ======
+def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_BASE_GERAL}"
-    print(f"[base_geral] FULL LOAD → {table_id} a partir de gs://{gcs_bucket}/{gcs_object}")
+    print(f"[base_fixed] FULL LOAD (colunas fixas) → {table_id} a partir de gs://{gcs_bucket}/{gcs_object}")
 
-    # baixa
     storage_client = storage.Client()
     blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
-    xlsx_path = os.path.join(tempfile.gettempdir(), "base_geral.xlsx")
+    xlsx_path = os.path.join(tempfile.gettempdir(), "base_fixed.xlsx")
     blob.download_to_filename(xlsx_path)
 
-    # lê e normaliza
-    df = pd.read_excel(xlsx_path)
+    # 1) lê SEM header (header=None)
+    df = pd.read_excel(xlsx_path, header=None)
+    # 2) remove linhas totalmente vazias
     df.dropna(how="all", inplace=True)
-    df = normalize_headers_df(df)
+    df.reset_index(drop=True, inplace=True)
+    # 3) descarta a primeira linha (header humano)
+    if len(df) >= 1:
+        df = df.iloc[1:].reset_index(drop=True)
+
+    # 4) força o número de colunas para o tamanho fixo
+    need_cols = len(BASE_FIXED_COLUMNS)
+    # se tem menos colunas, completa com None
+    if df.shape[1] < need_cols:
+        for _ in range(need_cols - df.shape[1]):
+            df[df.shape[1]] = None
+    # se tem mais colunas, corta
+    if df.shape[1] > need_cols:
+        df = df.iloc[:, :need_cols]
+    # aplica os nomes fixos
+    df.columns = BASE_FIXED_COLUMNS
+
+    # 5) tudo STRING/None
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
-    # JSONL + LOAD (WRITE_TRUNCATE, CREATE_IF_NEEDED cria a tabela se faltar)
-    jsonl_path = os.path.join(tempfile.gettempdir(), "base_geral.jsonl")
+    # 6) JSONL + LOAD (WRITE_TRUNCATE)
+    jsonl_path = os.path.join(tempfile.gettempdir(), "base_fixed.jsonl")
     df_to_jsonl(df, jsonl_path)
 
-    schema = build_string_schema(list(df.columns))
+    schema = build_string_schema(BASE_FIXED_COLUMNS)
     job_config = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
@@ -147,17 +189,16 @@ def process_base_geral(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     job.result()
 
     table = bq.get_table(table_id)
-    print(f"[base_geral] FULL LOAD concluído: {table.num_rows} linhas")
+    print(f"[base_fixed] FULL LOAD concluído: {table.num_rows} linhas")
 
-# ===================== FLUXO 2: qualquer outro .xlsx (INCREMENTAL QGC) =====================
+# =========== INCREMENTAL: QGC (nomearquivo + data_inclusao, substitui por arquivo) ===========
 QGC_BASE_COLUMNS  = ["grupo","empresa","fonte","classe","subclasse","credor","moeda","valor","data"]
-QGC_FINAL_COLUMNS = QGC_BASE_COLUMNS + ["nomearquivo"]
+QGC_FINAL_COLUMNS = QGC_BASE_COLUMNS + ["nomearquivo", "data_inclusao"]
 
 def ensure_qgc_table(bq: bigquery.Client):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
     try:
         table = bq.get_table(table_id)
-        # garante que 'nomearquivo' exista
         existing = {f.name for f in table.schema}
         to_add = [c for c in QGC_FINAL_COLUMNS if c not in existing]
         if to_add:
@@ -176,35 +217,31 @@ def ensure_qgc_table(bq: bigquery.Client):
 def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     final_table = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
     base_name   = os.path.basename(gcs_object)
+    now_str     = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[qgc] INCREMENTAL (por arquivo) → {final_table} a partir de {base_name}")
 
-    # baixa
     storage_client = storage.Client()
     blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
     xlsx_path = os.path.join(tempfile.gettempdir(), f"qgc_{int(time.time())}.xlsx")
     blob.download_to_filename(xlsx_path)
 
-    # lê e normaliza headers
+    # aqui mantemos leitura comum com header na 1ª linha (se preferir, dá pra fazer como no base_fixed)
     df = pd.read_excel(xlsx_path)
     df.dropna(how="all", inplace=True)
-    df = normalize_headers_df(df)
 
-    # garante colunas base; extras são ignoradas
+    # garante colunas base (cria faltantes), depois ordena e corta/extrai só elas
     for col in QGC_BASE_COLUMNS:
         if col not in df.columns:
             df[col] = None
-
-    # seleciona e ordena as colunas base
     df = df[QGC_BASE_COLUMNS]
 
-    # converte tudo para STRING/None
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
-    # adiciona a coluna de controle por arquivo
-    df["nomearquivo"] = base_name
+    df["nomearquivo"]   = base_name
+    df["data_inclusao"] = now_str
 
-    # staging JSONL
+    # staging
     ts = int(time.time())
     staging_table = f"{PROJECT_ID}.{BQ_DATASET}._qgc_stage_{ts}"
     jsonl_path = os.path.join(tempfile.gettempdir(), f"qgc_{ts}.jsonl")
@@ -212,7 +249,6 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
 
     ensure_qgc_table(bq)
 
-    # carrega staging (WRITE_TRUNCATE)
     staging_schema = build_string_schema(QGC_FINAL_COLUMNS)
     load_cfg = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
@@ -226,7 +262,7 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     load_job.result()
     print(f"[qgc] Staging carregado: {staging_table}")
 
-    # substitui todos os registros daquele arquivo (idempotência por nomearquivo)
+    # substitui todo o conteúdo do mesmo arquivo
     params = [bigquery.ScalarQueryParameter("file", "STRING", base_name)]
     bq.query(
         f"DELETE FROM `{final_table}` WHERE nomearquivo = @file",
@@ -239,7 +275,6 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     bq.query(insert_sql).result()
     print("[qgc] Insert concluído.")
 
-    # limpa staging
     try:
         bq.delete_table(staging_table, not_found_ok=True)
         print("[qgc] Staging removido.")
@@ -257,29 +292,25 @@ def entryPoint(data, context):
     base = os.path.basename(name)
     bq = bigquery.Client()
 
-    # garante dataset e tabela de status no início (para sempre conseguir logar)
     ensure_dataset(bq, BQ_DATASET)
     ensure_status_table(bq)
 
-    # Regra 1: base_geral.xlsx -> FULL LOAD
-    if base.lower() == "base_geral.xlsx":
+    # base_legal.xlsx OU base_geral.xlsx -> FULL LOAD com colunas fixas, ignorando header
+    if base.lower() in ("base_legal.xlsx", "base_geral.xlsx"):
         try:
-            process_base_geral(bq, bucket, name)
+            process_base_fixed(bq, bucket, name)
             log_status(bq, base, "SUCESSO", "implementado com sucesso")
         except Exception as e:
-            # ❌ sem raise: não gera retry
             log_status(bq, base, "ERRO", str(e))
         return
 
-    # Regra 2: qualquer outro .xlsx -> INCREMENTAL QGC
+    # qualquer outro .xlsx -> QGC incremental
     if base.lower().endswith(".xlsx"):
         try:
             process_qgc_incremental(bq, bucket, name)
             log_status(bq, base, "SUCESSO", "implementado com sucesso")
         except Exception as e:
-            # ❌ sem raise: não gera retry
             log_status(bq, base, "ERRO", str(e))
         return
 
-    # sem regra
     print(f"Ignorando objeto sem regra: {name}")
