@@ -14,63 +14,37 @@ TABLE_NAME_BASE_GERAL   = "base_geral"
 TABLE_NAME_QGC          = "qgc"
 STATUS_TABLE_NAME       = "status_implantacao"
 
-# seu ambiente
 BQ_DATASET = "tmabrasil"
 PROJECT_ID = "tmabrasil"
 
 # Colunas FIXAS (100% STRING) para base_legal/base_geral
 BASE_FIXED_COLUMNS = [
-    "empresa",
-    "id",
-    "sem_arquivos_digitais",
-    "com_qgc_feito",
-    "tipo_de_sociedade",
-    "capital_aberto",
-    "setor_de_atuacao",
-    "subsetor",
-    "estado",
-    "cidade",
-    "estado2",
-    "vara",
-    "vara_especializada",
-    "pericia_previa",
-    "empresa_pericia_previa",
-    "advogado",
-    "consultoria_assessoria_financeira_reestruturacao",
-    "substituicao_do_aj",
-    "destituicao_do_aj",
-    "_1o_administrador_judicial",
-    "_2o_administrador_judicial",
-    "_3o_administrador_judicial",
-    "tipo",
-    "consolidacao_substancial",
+    "empresa","id","sem_arquivos_digitais","com_qgc_feito","tipo_de_sociedade",
+    "capital_aberto","setor_de_atuacao","subsetor","estado","cidade","estado2",
+    "vara","vara_especializada","pericia_previa","empresa_pericia_previa",
+    "advogado","consultoria_assessoria_financeira_reestruturacao",
+    "substituicao_do_aj","destituicao_do_aj",
+    "_1o_administrador_judicial","_2o_administrador_judicial","_3o_administrador_judicial",
+    "tipo","consolidacao_substancial",
     "tamanho_aproximado_da_rj_valor_da_divida_declarado_nos_documentos_iniciais",
     "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o",
-    "modalidade_de_remuneracao_do_aj",
-    "remuneracao_aj_do_passivo",
+    "modalidade_de_remuneracao_do_aj","remuneracao_aj_do_passivo",
     "remuneracao_aj_valor_total",
     "remuneracao_aj_r_parcelas_mensais_honorarios_provisorios",
     "remuneracao_aj_r_parcelas_mensais_honorarios_definitivos",
     "quantidade_de_assembleias_para_aprovacao",
-    "houve_apresentacao_de_plano_pelos_credores",
-    "n_processo",
-    "link_processo",
-    "link_logo",
-    "link_ri_outros",
-    "termos",
-    "informacoes",
-    "data_de_manipulacao",
-    "segredo_de_justica",
-    "processo_fisico_ou_digital",
-    "revisao",
-    "status_do_processo",
+    "houve_apresentacao_de_plano_pelos_credores","n_processo",
+    "link_processo","link_logo","link_ri_outros","termos","informacoes",
+    "data_de_manipulacao","segredo_de_justica","processo_fisico_ou_digital",
+    "revisao","status_do_processo",
 ]
 
-# Colunas FIXAS do QGC (STRING)
+# QGC (11 colunas STRING em UPPERCASE)
 QGC_COLUMNS = [
-    "GRUPO", "EMPRESA", "FONTE", "CLASSE", "SUBCLASSE", "CREDOR",
-    "MOEDA", "VALOR", "DATA", "NOMEARQUIVO", "DATAIMPLEMENTACAO"
+    "GRUPO","EMPRESA","FONTE","CLASSE","SUBCLASSE","CREDOR",
+    "MOEDA","VALOR","DATA","NOMEARQUIVO","DATAIMPLEMENTACAO"
 ]
+QGC_BASE_CNT = 9  # A:I
 
 # ===================== HELPERS =====================
 def to_str_or_none(v):
@@ -122,8 +96,7 @@ def ensure_status_table(bq: bigquery.Client):
             bigquery.SchemaField("status", "STRING"),
             bigquery.SchemaField("mensagem", "STRING"),
         ]
-        table = bigquery.Table(table_id, schema=schema)
-        bq.create_table(table)
+        bq.create_table(bigquery.Table(table_id, schema=schema))
         print("[status] Tabela de status criada.")
 
 def log_status(bq: bigquery.Client, nome_arquivo: str, status: str, mensagem: str):
@@ -140,24 +113,23 @@ def log_status(bq: bigquery.Client, nome_arquivo: str, status: str, mensagem: st
     except Exception as e:
         print(f"[status] Falha ao registrar status: {e}")
 
-# ====== FULL LOAD: base_legal/base_geral (ignora header e usa colunas fixas) ======
+# ===== FULL LOAD: base_legal/base_geral (ignora header e usa colunas fixas) =====
 def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_BASE_GERAL}"
-    print(f"[base_fixed] FULL LOAD (colunas fixas) → {table_id} a partir de gs://{gcs_bucket}/{gcs_object}")
+    print(f"[base_fixed] FULL LOAD → {table_id} de gs://{gcs_bucket}/{gcs_object}")
 
     storage_client = storage.Client()
     blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
     xlsx_path = os.path.join(tempfile.gettempdir(), "base_fixed.xlsx")
     blob.download_to_filename(xlsx_path)
 
-    # lê SEM header e descarta a primeira linha (header humano)
+    # lê sem header, descarta 1ª linha (header humano)
     df = pd.read_excel(xlsx_path, header=None)
     df.dropna(how="all", inplace=True)
     df.reset_index(drop=True, inplace=True)
     if len(df) >= 1:
         df = df.iloc[1:].reset_index(drop=True)
 
-    # força número e nomes das colunas
     need_cols = len(BASE_FIXED_COLUMNS)
     if df.shape[1] < need_cols:
         for _ in range(need_cols - df.shape[1]):
@@ -166,11 +138,9 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
         df = df.iloc[:, :need_cols]
     df.columns = BASE_FIXED_COLUMNS
 
-    # tudo STRING
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
-    # JSONL + LOAD
     jsonl_path = os.path.join(tempfile.gettempdir(), "base_fixed.jsonl")
     df_to_jsonl(df, jsonl_path)
 
@@ -183,13 +153,10 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
         autodetect=False,
     )
     with open(jsonl_path, "rb") as f:
-        job = bq.load_table_from_file(f, table_id, job_config=job_config)
-    job.result()
+        bq.load_table_from_file(f, table_id, job_config=job_config).result()
+    print("[base_fixed] FULL LOAD concluído.")
 
-    table = bq.get_table(table_id)
-    print(f"[base_fixed] FULL LOAD concluído: {table.num_rows} linhas")
-
-# =========== INCREMENTAL: QGC (11 colunas UPPERCASE, substitui por arquivo) ===========
+# =========== INCREMENTAL: QGC (ler exatamente A:I) ===========
 def ensure_qgc_table(bq: bigquery.Client):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
     try:
@@ -200,47 +167,46 @@ def ensure_qgc_table(bq: bigquery.Client):
             new_schema = list(table.schema) + [bigquery.SchemaField(c, "STRING") for c in to_add]
             table.schema = new_schema
             bq.update_table(table, ["schema"])
-            print(f"[qgc] Schema atualizado com colunas: {to_add}")
+            print(f"[qgc] Schema atualizado com: {to_add}")
         return
     except NotFound:
-        print("[qgc] Tabela não existe. Criando...")
-        schema = build_string_schema(QGC_COLUMNS)
-        table = bigquery.Table(table_id, schema=schema)
-        bq.create_table(table)
+        bq.create_table(bigquery.Table(table_id, schema=build_string_schema(QGC_COLUMNS)))
         print("[qgc] Tabela criada.")
 
 def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     final_table = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
     base_name   = os.path.basename(gcs_object)
     now_str     = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[qgc] INCREMENTAL (por arquivo) → {final_table} a partir de {base_name}")
+    print(f"[qgc] INCREMENTAL → {final_table} de {base_name}")
 
     storage_client = storage.Client()
     blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
     xlsx_path = os.path.join(tempfile.gettempdir(), f"qgc_{int(time.time())}.xlsx")
     blob.download_to_filename(xlsx_path)
 
-    # lê SEM header e descarta a primeira linha (header humano)
-    df = pd.read_excel(xlsx_path, header=None)
+    # ✅ lê SEM header e pega EXATAMENTE as colunas A:I
+    # (evita pegar colunas "fantasmas" vazias à esquerda/direita)
+    df = pd.read_excel(xlsx_path, header=None, usecols="A:I")
+    # remove linhas totalmente vazias
     df.dropna(how="all", inplace=True)
     df.reset_index(drop=True, inplace=True)
+    # descarta a 1ª linha (header humano)
     if len(df) >= 1:
         df = df.iloc[1:].reset_index(drop=True)
 
-    # força exatamente as 9 primeiras colunas de dados
-    base_cols_cnt = 9  # GRUPO..DATA
-    if df.shape[1] < base_cols_cnt:
-        for _ in range(base_cols_cnt - df.shape[1]):
+    # garante 9 colunas e nomeia como GRUPO..DATA
+    if df.shape[1] < QGC_BASE_CNT:
+        for _ in range(QGC_BASE_CNT - df.shape[1]):
             df[df.shape[1]] = None
-    if df.shape[1] > base_cols_cnt:
-        df = df.iloc[:, :base_cols_cnt]
+    if df.shape[1] > QGC_BASE_CNT:
+        df = df.iloc[:, :QGC_BASE_CNT]
+    df.columns = QGC_COLUMNS[:QGC_BASE_CNT]
 
-    # adiciona colunas de controle (nome do arquivo e timestamp)
+    # adiciona controle
     df["NOMEARQUIVO"]       = base_name
     df["DATAIMPLEMENTACAO"] = now_str
 
-    # reordena para exatamente QGC_COLUMNS (11 colunas)
-    # cria faltantes caso algo tenha faltado
+    # reordena para 11 colunas finais
     for col in QGC_COLUMNS:
         if col not in df.columns:
             df[col] = None
@@ -267,26 +233,21 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
         autodetect=False,
     )
     with open(jsonl_path, "rb") as f:
-        load_job = bq.load_table_from_file(f, staging_table, job_config=load_cfg)
-    load_job.result()
-    print(f"[qgc] Staging carregado: {staging_table}")
+        bq.load_table_from_file(f, staging_table, job_config=load_cfg).result()
 
-    # substitui todo o conteúdo do mesmo arquivo (idempotência por NOMEARQUIVO)
+    # substitui conteúdo do mesmo arquivo
     params = [bigquery.ScalarQueryParameter("file", "STRING", base_name)]
     bq.query(
         f"DELETE FROM `{final_table}` WHERE NOMEARQUIVO = @file",
         job_config=bigquery.QueryJobConfig(query_parameters=params),
     ).result()
-    print(f"[qgc] Registros antigos removidos para NOMEARQUIVO={base_name}")
-
-    insert_cols = ", ".join(QGC_COLUMNS)
-    insert_sql  = f"INSERT INTO `{final_table}` ({insert_cols}) SELECT {insert_cols} FROM `{staging_table}`"
-    bq.query(insert_sql).result()
-    print("[qgc] Insert concluído.")
+    bq.query(
+        f"INSERT INTO `{final_table}` ({', '.join(QGC_COLUMNS)}) "
+        f"SELECT {', '.join(QGC_COLUMNS)} FROM `{staging_table}`"
+    ).result()
 
     try:
         bq.delete_table(staging_table, not_found_ok=True)
-        print("[qgc] Staging removido.")
     except Exception as e:
         print(f"[qgc] Falha ao remover staging: {e}")
 
@@ -304,7 +265,6 @@ def entryPoint(data, context):
     ensure_dataset(bq, BQ_DATASET)
     ensure_status_table(bq)
 
-    # base_legal.xlsx OU base_geral.xlsx -> FULL LOAD com colunas fixas, ignorando header
     if base.lower() in ("base_legal.xlsx", "base_geral.xlsx"):
         try:
             process_base_fixed(bq, bucket, name)
@@ -313,7 +273,6 @@ def entryPoint(data, context):
             log_status(bq, base, "ERRO", str(e))
         return
 
-    # qualquer outro .xlsx -> QGC incremental (11 colunas fixas em UPPERCASE)
     if base.lower().endswith(".xlsx"):
         try:
             process_qgc_incremental(bq, bucket, name)
