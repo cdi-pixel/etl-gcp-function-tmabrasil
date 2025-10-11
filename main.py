@@ -14,6 +14,7 @@ TABLE_NAME_BASE_GERAL   = "base_geral"
 TABLE_NAME_QGC          = "qgc"
 STATUS_TABLE_NAME       = "status_implantacao"
 
+# seu ambiente
 BQ_DATASET = "tmabrasil"
 PROJECT_ID = "tmabrasil"
 
@@ -44,7 +45,7 @@ QGC_COLUMNS = [
     "GRUPO","EMPRESA","FONTE","CLASSE","SUBCLASSE","CREDOR",
     "MOEDA","VALOR","DATA","NOMEARQUIVO","DATAIMPLEMENTACAO"
 ]
-QGC_BASE_CNT = 9  # A:I
+QGC_BASE_CNT = 9  # GRUPO..DATA
 
 # ===================== HELPERS =====================
 def to_str_or_none(v):
@@ -123,13 +124,14 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     xlsx_path = os.path.join(tempfile.gettempdir(), "base_fixed.xlsx")
     blob.download_to_filename(xlsx_path)
 
-    # lê sem header, descarta 1ª linha (header humano)
+    # lê sem header e descarta a primeira linha (header humano)
     df = pd.read_excel(xlsx_path, header=None)
     df.dropna(how="all", inplace=True)
     df.reset_index(drop=True, inplace=True)
     if len(df) >= 1:
         df = df.iloc[1:].reset_index(drop=True)
 
+    # força número e nomes de colunas
     need_cols = len(BASE_FIXED_COLUMNS)
     if df.shape[1] < need_cols:
         for _ in range(need_cols - df.shape[1]):
@@ -138,9 +140,11 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
         df = df.iloc[:, :need_cols]
     df.columns = BASE_FIXED_COLUMNS
 
+    # tudo STRING
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
+    # gera JSONL e carrega com WRITE_TRUNCATE
     jsonl_path = os.path.join(tempfile.gettempdir(), "base_fixed.jsonl")
     df_to_jsonl(df, jsonl_path)
 
@@ -154,9 +158,10 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     )
     with open(jsonl_path, "rb") as f:
         bq.load_table_from_file(f, table_id, job_config=job_config).result()
+
     print("[base_fixed] FULL LOAD concluído.")
 
-# =========== INCREMENTAL: QGC (ler exatamente A:I) ===========
+# =========== INCREMENTAL: QGC (aceita 8 ou 9 colunas de dados) ===========
 def ensure_qgc_table(bq: bigquery.Client):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
     try:
@@ -184,39 +189,49 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     xlsx_path = os.path.join(tempfile.gettempdir(), f"qgc_{int(time.time())}.xlsx")
     blob.download_to_filename(xlsx_path)
 
-    # ✅ lê SEM header e pega EXATAMENTE as colunas A:I
-    # (evita pegar colunas "fantasmas" vazias à esquerda/direita)
-    df = pd.read_excel(xlsx_path, header=None, usecols="A:I")
-    # remove linhas totalmente vazias
+    # Lê SEM header (aceita 8 ou 9 colunas)
+    df = pd.read_excel(xlsx_path, header=None)
+
+    # Remove linhas totalmente vazias e descarta a 1ª (header humano)
     df.dropna(how="all", inplace=True)
     df.reset_index(drop=True, inplace=True)
-    # descarta a 1ª linha (header humano)
     if len(df) >= 1:
         df = df.iloc[1:].reset_index(drop=True)
 
-    # garante 9 colunas e nomeia como GRUPO..DATA
+    # Remove colunas 100% vazias (corrige colunas “fantasmas”)
+    if df.shape[1] > 0:
+        df = df.dropna(axis=1, how="all").reset_index(drop=True)
+
+    # Tratamento SUBCLASSE ausente:
+    # Se vierem 8 colunas (sem SUBCLASSE), insere coluna vazia na posição 4 (entre CLASSE e CREDOR).
+    if df.shape[1] == 8:
+        df.insert(4, "__SUBCLASSE_MISSING__", None)
+
+    # Garante exatamente 9 colunas de dados (GRUPO..DATA)
     if df.shape[1] < QGC_BASE_CNT:
         for _ in range(QGC_BASE_CNT - df.shape[1]):
             df[df.shape[1]] = None
     if df.shape[1] > QGC_BASE_CNT:
         df = df.iloc[:, :QGC_BASE_CNT]
+
+    # Nomeia as 9 colunas base
     df.columns = QGC_COLUMNS[:QGC_BASE_CNT]
 
-    # adiciona controle
+    # Colunas de controle
     df["NOMEARQUIVO"]       = base_name
     df["DATAIMPLEMENTACAO"] = now_str
 
-    # reordena para 11 colunas finais
+    # Reordena para as 11 finais
     for col in QGC_COLUMNS:
         if col not in df.columns:
             df[col] = None
     df = df[QGC_COLUMNS]
 
-    # tudo STRING
+    # STRING
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
-    # staging
+    # Staging -> Load -> DELETE por NOMEARQUIVO -> INSERT
     ts = int(time.time())
     staging_table = f"{PROJECT_ID}.{BQ_DATASET}._qgc_stage_{ts}"
     jsonl_path = os.path.join(tempfile.gettempdir(), f"qgc_{ts}.jsonl")
@@ -224,18 +239,16 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
 
     ensure_qgc_table(bq)
 
-    staging_schema = build_string_schema(QGC_COLUMNS)
     load_cfg = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
-        schema=staging_schema,
+        schema=build_string_schema(QGC_COLUMNS),
         autodetect=False,
     )
     with open(jsonl_path, "rb") as f:
         bq.load_table_from_file(f, staging_table, job_config=load_cfg).result()
 
-    # substitui conteúdo do mesmo arquivo
     params = [bigquery.ScalarQueryParameter("file", "STRING", base_name)]
     bq.query(
         f"DELETE FROM `{final_table}` WHERE NOMEARQUIVO = @file",
@@ -265,6 +278,7 @@ def entryPoint(data, context):
     ensure_dataset(bq, BQ_DATASET)
     ensure_status_table(bq)
 
+    # base_legal/base_geral -> FULL LOAD com colunas fixas (ignora header humano)
     if base.lower() in ("base_legal.xlsx", "base_geral.xlsx"):
         try:
             process_base_fixed(bq, bucket, name)
@@ -273,6 +287,7 @@ def entryPoint(data, context):
             log_status(bq, base, "ERRO", str(e))
         return
 
+    # demais .xlsx -> QGC incremental (11 colunas, SUBCLASSE opcional)
     if base.lower().endswith(".xlsx"):
         try:
             process_qgc_incremental(bq, bucket, name)
