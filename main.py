@@ -3,25 +3,20 @@ import json
 import time
 import uuid
 import tempfile
-import unicodedata
-from typing import List, Dict, Tuple
 from datetime import datetime
-
+from typing import List, Dict
 import pandas as pd
 from google.cloud import storage, bigquery
-from google.api_core.exceptions import NotFound
-from google.api_core import retry as g_retry
+from google.api_core.exceptions import NotFound, BadRequest, GoogleAPICallError
 
 # ===================== CONFIG =====================
 TABLE_NAME_BASE_GERAL   = "base_geral"
 TABLE_NAME_QGC          = "qgc"
 STATUS_TABLE_NAME       = "status_implantacao"
 
-# seu ambiente
 BQ_DATASET = "tmabrasil"
 PROJECT_ID = "tmabrasil"
 
-# Colunas FIXAS (100% STRING) para base_legal/base_geral (target no BQ)
 BASE_FIXED_COLUMNS = [
     "empresa","id","sem_arquivos_digitais","com_qgc_feito","tipo_de_sociedade",
     "capital_aberto","setor_de_atuacao","subsetor","estado","cidade","estado2",
@@ -43,12 +38,10 @@ BASE_FIXED_COLUMNS = [
     "revisao","status_do_processo",
 ]
 
-# QGC (11 colunas STRING em UPPERCASE)
 QGC_COLUMNS = [
     "GRUPO","EMPRESA","FONTE","CLASSE","SUBCLASSE","CREDOR",
     "MOEDA","VALOR","DATA","NOMEARQUIVO","DATAIMPLEMENTACAO"
 ]
-QGC_BASE_CNT = 9  # GRUPO..DATA
 
 # ===================== HELPERS =====================
 def to_str_or_none(v):
@@ -69,91 +62,12 @@ def to_str_or_none(v):
     s = str(v).strip()
     return s if s != "" else None
 
-def _slug(s: str) -> str:
-    """
-    Normaliza cabeçalhos:
-    - remove acentos (NFKD)
-    - 'º'/'°' -> 'o', '§' -> 's', '%' -> 'pct', 'R$' -> 'rs'
-    - '/' '-' e espaços -> '_'
-    - remove/normaliza pontuação, mantém [a-z0-9_]
-    """
-    if s is None:
-        return ""
-    s = str(s).strip()
-    s = s.replace("R$", "rs")
-    s = s.replace("º", "o").replace("°", "o")
-    s = s.replace("%", "pct")
-    s = s.replace("/", "_").replace("-", " ")
-    s = s.replace("§", "s")
-    s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    out = []
-    for ch in s:
-        if ch.isalnum():
-            out.append(ch.lower())
-        elif ch in [" ", "_"]:
-            out.append("_")
-        else:
-            out.append("_")
-    s = "".join(out)
-    s = "_".join(filter(None, s.split("_")))
-    return s
-
-# mapa de sinônimos de headers → coluna-alvo (usando _slug)
-HEADER_ALIASES: Dict[str, str] = {
-    "empresa": "empresa",
-    "id": "id",
-    "sem_arquivos_digitais": "sem_arquivos_digitais",
-    "com_qgc_feito": "com_qgc_feito",
-    "capital_aberto": "capital_aberto",
-    "setor_de_atuacao": "setor_de_atuacao",
-    "subsetor": "subsetor",
-    "estado": "estado",
-    "cidade": "cidade",
-    "estado2": "estado2",
-    "vara": "vara",
-    "vara_especializada": "vara_especializada",
-    "pericia_previa": "pericia_previa",
-    "empresa_pericia_previa": "empresa_pericia_previa",
-    "advogado": "advogado",
-    "consultoria_assessoria_financeira_reestruturacao": "consultoria_assessoria_financeira_reestruturacao",
-    "substituicao_do_aj": "substituicao_do_aj",
-    "destituicao_do_aj": "destituicao_do_aj",
-    "1o_administrador_judicial": "_1o_administrador_judicial",
-    "2o_administrador_judicial": "_2o_administrador_judicial",
-    "3o_administrador_judicial": "_3o_administrador_judicial",
-    "tipo": "tipo",
-    "tamanho_aproximado_da_rj_valor_da_divida_declarado_nos_documentos_iniciais":
-        "tamanho_aproximado_da_rj_valor_da_divida_declarado_nos_documentos_iniciais",
-    "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o": "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o",
-    "modalidade_de_remuneracao_do_aj": "modalidade_de_remuneracao_do_aj",
-    "remuneracao_aj_pct_do_passivo": "remuneracao_aj_do_passivo",
-    "remuneracao_aj_do_passivo": "remuneracao_aj_do_passivo",
-    "remuneracao_aj_valor_total": "remuneracao_aj_valor_total",
-    "remuneracao_aj_rs_parcelas_mensais_honorarios_provisorios":
-        "remuneracao_aj_r_parcelas_mensais_honorarios_provisorios",
-    "remuneracao_aj_rs_parcelas_mensais_honorarios_definitivos":
-        "remuneracao_aj_r_parcelas_mensais_honorarios_definitivos",
-    "quantidade_de_assembleias_para_aprovacao": "quantidade_de_assembleias_para_aprovacao",
-    "houve_apresentacao_de_plano_pelos_credores": "houve_apresentacao_de_plano_pelos_credores",
-    "n_processo": "n_processo",
-    "link_processo": "link_processo",
-    "link_logo": "link_logo",
-    "link_ri_outros": "link_ri_outros",
-    "termos": "termos",
-    "informacoes": "informacoes",
-    "data_de_manipulacao": "data_de_manipulacao",
-    "segredo_de_justica": "segredo_de_justica",
-    "processo_fisico_ou_digital": "processo_fisico_ou_digital",
-    "revisao": "revisao",
-    "status_processo": "status_do_processo",
-    # sinônimos usuais:
-    "uf": "estado",
-    "numero_do_processo": "n_processo",
-    "_1o_administrador_judicial": "_1o_administrador_judicial",
-    "_2o_administrador_judicial": "_2o_administrador_judicial",
-    "_3o_administrador_judicial": "_3o_administrador_judicial",
-}
+def _slug(s: str):
+    import re, unicodedata
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode("ascii")
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9_]+", "_", s)
+    return s.strip("_")
 
 def ensure_dataset(bq: bigquery.Client, dataset_id: str):
     ds_ref = bigquery.Dataset(f"{PROJECT_ID}.{dataset_id}")
@@ -173,12 +87,10 @@ def df_to_jsonl(df: pd.DataFrame, jsonl_path: str):
             f.write(json.dumps(obj, ensure_ascii=False) + "\n")
     return jsonl_path
 
-# -------- status table (logs) --------
 def ensure_status_table(bq: bigquery.Client):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{STATUS_TABLE_NAME}"
     try:
         bq.get_table(table_id)
-        return
     except NotFound:
         schema = [
             bigquery.SchemaField("data_envio", "TIMESTAMP"),
@@ -203,23 +115,8 @@ def log_status(bq: bigquery.Client, nome_arquivo: str, status: str, mensagem: st
     except Exception as e:
         print(f"[status] Falha ao registrar status: {e}")
 
-# ===================== RETRY HELPERS =====================
-_default_retry = g_retry.Retry(
-    predicate=g_retry.if_exception_type(Exception),
-    initial=1.0,
-    maximum=10.0,
-    multiplier=2.0,
-    deadline=120.0
-)
-def wait_job(job):
-    return _default_retry(job.result)()
-
-# ===================== EXCEL SHEET PICKER =====================
+# ===================== BASE GERAL =====================
 def _pick_sheet(xlsx_path: str) -> str:
-    """
-    Procura a aba 'lista de informações' (com/sem acento, case-insensitive).
-    Aceita variações: 'lista de informacoes', 'Lista de Informações', etc.
-    """
     xf = pd.ExcelFile(xlsx_path)
     wanted = {"lista_de_informacoes", "lista_de_informacao"}
     slug_map = {sh: _slug(sh) for sh in xf.sheet_names}
@@ -227,49 +124,9 @@ def _pick_sheet(xlsx_path: str) -> str:
         if sl in wanted:
             print(f"[base_fixed] Aba selecionada: '{sh}' (slug='{sl}')")
             return sh
-    print(f"[base_fixed] Aba 'lista de informações' NÃO encontrada. Abas: {xf.sheet_names}")
-    # Falha suave: usa a primeira (ou troque por raise ValueError)
+    print(f"[base_fixed] Aba 'lista de informações' NÃO encontrada. Usando primeira: {xf.sheet_names[0]}")
     return xf.sheet_names[0]
 
-# ===== Header mapping helpers =====
-def _map_headers_to_targets(cols: List[str]) -> Dict[int, str]:
-    slugs = [_slug(c) for c in cols]
-    mapping: Dict[int, str] = {}
-    for i, s in enumerate(slugs):
-        if s in HEADER_ALIASES:
-            mapping[i] = HEADER_ALIASES[s]
-        elif s in BASE_FIXED_COLUMNS:
-            mapping[i] = s
-        else:
-            if s.startswith("1") and "administrador" in s:
-                mapping[i] = "_1o_administrador_judicial"
-            elif s.startswith("2") and "administrador" in s:
-                mapping[i] = "_2o_administrador_judicial"
-            elif s.startswith("3") and "administrador" in s:
-                mapping[i] = "_3o_administrador_judicial"
-    return mapping
-
-def _looks_like_header(row0: List[str]) -> bool:
-    texts = 0
-    for v in row0:
-        if isinstance(v, str) and any(ch.isalpha() for ch in v):
-            texts += 1
-    return texts >= max(3, int(len(row0) * 0.4))
-
-def _debug_header_mapping(cols_excel: List[str], mapping: Dict[int, str]):
-    slugs = [_slug(c) for c in cols_excel]
-    print("[base_fixed][debug] Detalhe de mapeamento de colunas:")
-    for i, (orig, slug) in enumerate(zip(cols_excel, slugs)):
-        tgt = mapping.get(i, "UNMAPPED")
-        print(f"  [{i:02d}] '{orig}'  -> slug='{slug}'  => {tgt}")
-
-def _maybe_normalize_numbers(df: pd.DataFrame, cols_like_money: List[str]):
-    # troca ',' por '.' em strings numéricas, sem forçar tipo (mantemos STRING no BQ)
-    for c in cols_like_money:
-        if c in df.columns:
-            df[c] = df[c].map(lambda v: None if v is None else str(v).replace("\u00A0"," ").replace(",", ".").strip())
-
-# ===== FULL LOAD: base_legal/base_geral =====
 def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_BASE_GERAL}"
     print(f"[base_fixed] FULL LOAD → {table_id} de gs://{gcs_bucket}/{gcs_object}")
@@ -280,103 +137,44 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     jsonl_path = os.path.join(tempfile.gettempdir(), f"base_fixed_{uniq}.jsonl")
     storage_client.bucket(gcs_bucket).blob(gcs_object).download_to_filename(xlsx_path)
 
-    # escolhe a aba certa
     sheet = _pick_sheet(xlsx_path)
+    df = pd.read_excel(xlsx_path, header=0, sheet_name=sheet)
+    df.dropna(how="all", inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
-    # 1) Tenta ler assumindo header
-    df_try = pd.read_excel(xlsx_path, header=0, sheet_name=sheet)
-    header_row = list(df_try.columns)
-    use_header = _looks_like_header(header_row)
+    slugged = [_slug(c) for c in df.columns]
+    mapping = dict(zip(slugged, df.columns))
 
-    if use_header:
-        header_mapping = _map_headers_to_targets(header_row)
-        _debug_header_mapping(header_row, header_mapping)
+    std = pd.DataFrame(columns=BASE_FIXED_COLUMNS)
+    for col in BASE_FIXED_COLUMNS:
+        slug = _slug(col)
+        src = mapping.get(slug)
+        std[col] = df[src] if src in df.columns else None
 
-        # mapeia por NOME (robusto à ordem)
-        name_to_target = {}
-        for col_name in header_row:
-            slug = _slug(col_name)
-            if slug in HEADER_ALIASES:
-                name_to_target[col_name] = HEADER_ALIASES[slug]
-            elif slug in BASE_FIXED_COLUMNS:
-                name_to_target[col_name] = slug
-
-        df = df_try.copy()
-        df.dropna(how="all", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-        std = pd.DataFrame(index=range(len(df)))
-        for c in BASE_FIXED_COLUMNS:
-            std[c] = None
-
-        filled = 0
-        for src_name, tgt_col in name_to_target.items():
-            if tgt_col in std.columns and src_name in df.columns:
-                std.loc[:, tgt_col] = df[src_name]
-                filled += 1
-        print(f"[base_fixed][debug] Colunas preenchidas por nome: {filled}/{len(BASE_FIXED_COLUMNS)}")
-
-    else:
-        # 2) Fallback POSICIONAL (sem descartar primeira linha)
-        print("[base_fixed][debug] Header não reconhecido, usando fallback POSICIONAL.")
-        df = pd.read_excel(xlsx_path, header=None, sheet_name=sheet)
-        df.dropna(how="all", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-        std = pd.DataFrame(index=range(len(df)))
-        for c in BASE_FIXED_COLUMNS:
-            std[c] = None
-
-        for i in range(min(df.shape[1], len(BASE_FIXED_COLUMNS))):
-            std.iloc[:, i] = df.iloc[:, i]
-        print(f"[base_fixed][debug] Preenchidas por posição: {min(df.shape[1], len(BASE_FIXED_COLUMNS))}")
-
-    # normaliza números que costumam vir com vírgula (opcional)
-    _maybe_normalize_numbers(std, [
-        "tamanho_aproximado_da_rj_valor_da_divida_declarado_nos_documentos_iniciais",
-        "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o",
-        "remuneracao_aj_do_passivo",
-        "remuneracao_aj_valor_total",
-        "remuneracao_aj_r_parcelas_mensais_honorarios_provisorios",
-        "remuneracao_aj_r_parcelas_mensais_honorarios_definitivos",
-    ])
-
-    # tudo STRING
     for c in std.columns:
         std[c] = std[c].map(to_str_or_none)
 
-    # exporta e carrega
     df_to_jsonl(std, jsonl_path)
     schema = build_string_schema(BASE_FIXED_COLUMNS)
-    job_config = bigquery.LoadJobConfig(
+    cfg = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
-        schema=schema,
-        autodetect=False,
+        schema=schema
     )
     with open(jsonl_path, "rb") as f:
-        job = bq.load_table_from_file(f, table_id, job_config=job_config)
-    wait_job(job)
-
+        bq.load_table_from_file(f, table_id, job_config=cfg).result()
     print("[base_fixed] FULL LOAD concluído.")
 
-# =========== INCREMENTAL: QGC ===========
+# ===================== QGC INCREMENTAL =====================
 def ensure_qgc_table(bq: bigquery.Client):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
     try:
-        table = bq.get_table(table_id)
-        existing = {f.name for f in table.schema}
-        to_add = [c for c in QGC_COLUMNS if c not in existing]
-        if to_add:
-            new_schema = list(table.schema) + [bigquery.SchemaField(c, "STRING") for c in to_add]
-            table.schema = new_schema
-            bq.update_table(table, ["schema"])
-            print(f"[qgc] Schema atualizado com: {to_add}")
-        return
+        bq.get_table(table_id)
     except NotFound:
         bq.create_table(bigquery.Table(table_id, schema=build_string_schema(QGC_COLUMNS)))
         print("[qgc] Tabela criada.")
+    else:
+        print("[qgc] Tabela existente.")
 
 def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     final_table = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_QGC}"
@@ -386,86 +184,68 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
 
     storage_client = storage.Client()
     uniq = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
-    xlsx_path  = os.path.join(tempfile.gettempdir(), f"qgc_{uniq}.xlsx")
-    jsonl_path = os.path.join(tempfile.gettempdir(), f"qgc_{uniq}.jsonl")
+    xlsx_path = os.path.join(tempfile.gettempdir(), f"qgc_{uniq}.xlsx")
+    blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
+    blob.download_to_filename(xlsx_path)
 
-    storage_client.bucket(gcs_bucket).blob(gcs_object).download_to_filename(xlsx_path)
-
-    # Lê SEM header (aceita 8 ou 9 colunas)
     df = pd.read_excel(xlsx_path, header=None)
     df.dropna(how="all", inplace=True)
     df.reset_index(drop=True, inplace=True)
     if len(df) >= 1:
-        # descarta a 1ª (header humano) para QGC
         df = df.iloc[1:].reset_index(drop=True)
 
-    if df.shape[1] > 0:
-        df = df.dropna(axis=1, how="all").reset_index(drop=True)
-
-    # Tratamento SUBCLASSE ausente → 8 colunas
     if df.shape[1] == 8:
         df.insert(4, "__SUBCLASSE_MISSING__", None)
-
-    # Garante exatamente 9 colunas de dados (GRUPO..DATA)
-    if df.shape[1] < QGC_BASE_CNT:
-        for _ in range(QGC_BASE_CNT - df.shape[1]):
+    if df.shape[1] < 9:
+        for _ in range(9 - df.shape[1]):
             df[df.shape[1]] = None
-    if df.shape[1] > QGC_BASE_CNT:
-        df = df.iloc[:, :QGC_BASE_CNT]
-
-    df.columns = QGC_COLUMNS[:QGC_BASE_CNT]
-    df["NOMEARQUIVO"]       = base_name
+    if df.shape[1] > 9:
+        df = df.iloc[:, :9]
+    df.columns = QGC_COLUMNS[:9]
+    df["NOMEARQUIVO"] = base_name
     df["DATAIMPLEMENTACAO"] = now_str
-
-    for col in QGC_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-    df = df[QGC_COLUMNS]
 
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
+    staging = f"{PROJECT_ID}.{BQ_DATASET}._stage_{uniq}"
+    jsonl = os.path.join(tempfile.gettempdir(), f"stage_{uniq}.jsonl")
+    df_to_jsonl(df, jsonl)
     ensure_qgc_table(bq)
-    staging_table = f"{PROJECT_ID}.{BQ_DATASET}._qgc_stage_{uniq}"
 
-    df_to_jsonl(df, jsonl_path)
     load_cfg = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
-        schema=build_string_schema(QGC_COLUMNS),
-        autodetect=False,
+        write_disposition="WRITE_TRUNCATE",
+        schema=build_string_schema(QGC_COLUMNS)
     )
-    with open(jsonl_path, "rb") as f:
-        load_job = bq.load_table_from_file(f, staging_table, job_config=load_cfg)
-    wait_job(load_job)
+    with open(jsonl, "rb") as f:
+        bq.load_table_from_file(f, staging, job_config=load_cfg).result()
 
-    # Expiração do staging (30 min)
-    try:
-        table_obj = bq.get_table(staging_table)
-        table_obj.expires = datetime.utcnow() + pd.Timedelta(minutes=30)
-        bq.update_table(table_obj, ["expires"])
-    except Exception as e:
-        print(f"[qgc] Aviso: não defini expiração do staging: {e}")
-
-    # Transação: DELETE + INSERT (minimiza janela de corrida)
-    qcfg = bigquery.QueryJobConfig(
-        query_parameters=[bigquery.ScalarQueryParameter("file", "STRING", base_name)]
-    )
     sql = f"""
-    BEGIN TRANSACTION;
-      DELETE FROM `{final_table}` WHERE NOMEARQUIVO = @file;
-      INSERT INTO `{final_table}` ({', '.join(QGC_COLUMNS)})
-      SELECT {', '.join(QGC_COLUMNS)} FROM `{staging_table}`;
-    COMMIT TRANSACTION;
+    MERGE `{final_table}` AS T
+    USING `{staging}` AS S
+    ON T.NOMEARQUIVO = S.NOMEARQUIVO
+    WHEN MATCHED THEN DELETE
+    WHEN NOT MATCHED BY TARGET THEN
+      INSERT ({', '.join(QGC_COLUMNS)})
+      VALUES ({', '.join('S.' + c for c in QGC_COLUMNS)});
     """
-    query_job = bq.query(sql, job_config=qcfg)
-    wait_job(query_job)
 
-    try:
-        bq.delete_table(staging_table, not_found_ok=True)
-    except Exception as e:
-        print(f"[qgc] Falha ao remover staging: {e}")
+    for attempt in range(1, 8):
+        try:
+            bq.query(sql).result()
+            print(f"[qgc] MERGE concluído ({attempt} tentativa).")
+            break
+        except (BadRequest, GoogleAPICallError) as e:
+            msg = str(e)
+            if "Transaction is aborted" in msg or "concurrent update" in msg:
+                delay = min(2 ** attempt, 10)
+                print(f"[qgc] Conflito de concorrência, retry em {delay}s (tentativa {attempt})")
+                time.sleep(delay)
+                continue
+            raise
+    bq.delete_table(staging, not_found_ok=True)
+    print("[qgc] Incremental concluído.")
 
 # ===================== ENTRYPOINT =====================
 def entryPoint(data, context):
@@ -476,27 +256,16 @@ def entryPoint(data, context):
         return
 
     base = os.path.basename(name)
-    bq = bigquery.Client(project=PROJECT_ID)
-
+    bq = bigquery.Client()
     ensure_dataset(bq, BQ_DATASET)
     ensure_status_table(bq)
 
-    # base_legal/base_geral -> FULL LOAD na aba 'lista de informações'
-    if base.lower() in ("base_legal.xlsx", "base_geral.xlsx"):
-        try:
+    try:
+        if base.lower() in ("base_geral.xlsx", "base_legal.xlsx"):
             process_base_fixed(bq, bucket, name)
-            log_status(bq, base, "SUCESSO", "implementado com sucesso")
-        except Exception as e:
-            log_status(bq, base, "ERRO", str(e))
-        return
-
-    # demais .xlsx -> QGC incremental (11 colunas, SUBCLASSE opcional)
-    if base.lower().endswith(".xlsx"):
-        try:
+        elif base.lower().endswith(".xlsx"):
             process_qgc_incremental(bq, bucket, name)
-            log_status(bq, base, "SUCESSO", "implementado com sucesso")
-        except Exception as e:
-            log_status(bq, base, "ERRO", str(e))
-        return
-
-    print(f"Ignorando objeto sem regra: {name}")
+        log_status(bq, base, "SUCESSO", "Implementado com sucesso.")
+    except Exception as e:
+        log_status(bq, base, "ERRO", str(e))
+        raise
