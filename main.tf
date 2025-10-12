@@ -48,11 +48,12 @@ resource "google_cloudfunctions2_function" "fn" {
   }
 
   service_config {
-    available_memory        = "256M"
-    timeout_seconds         = 60
+    available_memory        = "512M"
+    timeout_seconds         = 540
     max_instance_count      = 3
     ingress_settings        = "ALLOW_ALL"
     # recomendo fixar a SA de runtime:
     service_account_email   = var.runtime_service_account # ex: "cf-runtime@tmabrasil.iam.gserviceaccount.com"
   }
 }
+
