@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import uuid
 import tempfile
 from typing import List
 from datetime import datetime
@@ -8,6 +9,7 @@ from datetime import datetime
 import pandas as pd
 from google.cloud import storage, bigquery
 from google.api_core.exceptions import NotFound
+from google.api_core import retry as g_retry
 
 # ===================== CONFIG =====================
 TABLE_NAME_BASE_GERAL   = "base_geral"
@@ -114,14 +116,31 @@ def log_status(bq: bigquery.Client, nome_arquivo: str, status: str, mensagem: st
     except Exception as e:
         print(f"[status] Falha ao registrar status: {e}")
 
+# ===================== RETRY HELPERS =====================
+# Retry genérico com backoff exponencial (até 120s)
+_default_retry = g_retry.Retry(
+    predicate=g_retry.if_exception_type(Exception),
+    initial=1.0,
+    maximum=10.0,
+    multiplier=2.0,
+    deadline=120.0
+)
+
+def wait_job(job):
+    """Espera job (load/query) com retry/backoff."""
+    return _default_retry(job.result)()
+
 # ===== FULL LOAD: base_legal/base_geral (ignora header e usa colunas fixas) =====
 def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     table_id = f"{PROJECT_ID}.{BQ_DATASET}.{TABLE_NAME_BASE_GERAL}"
     print(f"[base_fixed] FULL LOAD → {table_id} de gs://{gcs_bucket}/{gcs_object}")
 
     storage_client = storage.Client()
+    uniq = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+    xlsx_path = os.path.join(tempfile.gettempdir(), f"base_fixed_{uniq}.xlsx")
+    jsonl_path = os.path.join(tempfile.gettempdir(), f"base_fixed_{uniq}.jsonl")
+
     blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
-    xlsx_path = os.path.join(tempfile.gettempdir(), "base_fixed.xlsx")
     blob.download_to_filename(xlsx_path)
 
     # lê sem header e descarta a primeira linha (header humano)
@@ -145,7 +164,6 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
         df[c] = df[c].map(to_str_or_none)
 
     # gera JSONL e carrega com WRITE_TRUNCATE
-    jsonl_path = os.path.join(tempfile.gettempdir(), "base_fixed.jsonl")
     df_to_jsonl(df, jsonl_path)
 
     schema = build_string_schema(BASE_FIXED_COLUMNS)
@@ -157,7 +175,8 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
         autodetect=False,
     )
     with open(jsonl_path, "rb") as f:
-        bq.load_table_from_file(f, table_id, job_config=job_config).result()
+        load_job = bq.load_table_from_file(f, table_id, job_config=job_config)
+    wait_job(load_job)
 
     print("[base_fixed] FULL LOAD concluído.")
 
@@ -185,8 +204,11 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     print(f"[qgc] INCREMENTAL → {final_table} de {base_name}")
 
     storage_client = storage.Client()
+    uniq = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
+    xlsx_path  = os.path.join(tempfile.gettempdir(), f"qgc_{uniq}.xlsx")
+    jsonl_path = os.path.join(tempfile.gettempdir(), f"qgc_{uniq}.jsonl")
+
     blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
-    xlsx_path = os.path.join(tempfile.gettempdir(), f"qgc_{int(time.time())}.xlsx")
     blob.download_to_filename(xlsx_path)
 
     # Lê SEM header (aceita 8 ou 9 colunas)
@@ -231,14 +253,11 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     for c in df.columns:
         df[c] = df[c].map(to_str_or_none)
 
-    # Staging -> Load -> DELETE por NOMEARQUIVO -> INSERT
-    ts = int(time.time())
-    staging_table = f"{PROJECT_ID}.{BQ_DATASET}._qgc_stage_{ts}"
-    jsonl_path = os.path.join(tempfile.gettempdir(), f"qgc_{ts}.jsonl")
-    df_to_jsonl(df, jsonl_path)
-
+    # Staging -> Load -> (TX) DELETE por NOMEARQUIVO -> INSERT
     ensure_qgc_table(bq)
+    staging_table = f"{PROJECT_ID}.{BQ_DATASET}._qgc_stage_{uniq}"
 
+    df_to_jsonl(df, jsonl_path)
     load_cfg = bigquery.LoadJobConfig(
         source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
@@ -246,19 +265,35 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
         schema=build_string_schema(QGC_COLUMNS),
         autodetect=False,
     )
+
     with open(jsonl_path, "rb") as f:
-        bq.load_table_from_file(f, staging_table, job_config=load_cfg).result()
+        load_job = bq.load_table_from_file(f, staging_table, job_config=load_cfg)
+    wait_job(load_job)
 
-    params = [bigquery.ScalarQueryParameter("file", "STRING", base_name)]
-    bq.query(
-        f"DELETE FROM `{final_table}` WHERE NOMEARQUIVO = @file",
-        job_config=bigquery.QueryJobConfig(query_parameters=params),
-    ).result()
-    bq.query(
-        f"INSERT INTO `{final_table}` ({', '.join(QGC_COLUMNS)}) "
-        f"SELECT {', '.join(QGC_COLUMNS)} FROM `{staging_table}`"
-    ).result()
+    # Define expiração curta no staging pra evitar lixo
+    try:
+        table_obj = bq.get_table(staging_table)
+        # 30 minutos
+        table_obj.expires = datetime.utcnow() + pd.Timedelta(minutes=30)
+        bq.update_table(table_obj, ["expires"])
+    except Exception as e:
+        print(f"[qgc] Aviso: não defini expiração do staging: {e}")
 
+    # Transação: DELETE + INSERT (minimiza janela de corrida)
+    qcfg = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ScalarQueryParameter("file", "STRING", base_name)]
+    )
+    sql = f"""
+    BEGIN TRANSACTION;
+      DELETE FROM `{final_table}` WHERE NOMEARQUIVO = @file;
+      INSERT INTO `{final_table}` ({', '.join(QGC_COLUMNS)})
+      SELECT {', '.join(QGC_COLUMNS)} FROM `{staging_table}`;
+    COMMIT TRANSACTION;
+    """
+    query_job = bq.query(sql, job_config=qcfg)
+    wait_job(query_job)
+
+    # Limpeza do staging
     try:
         bq.delete_table(staging_table, not_found_ok=True)
     except Exception as e:
@@ -273,7 +308,7 @@ def entryPoint(data, context):
         return
 
     base = os.path.basename(name)
-    bq = bigquery.Client()
+    bq = bigquery.Client(project=PROJECT_ID)
 
     ensure_dataset(bq, BQ_DATASET)
     ensure_status_table(bq)
