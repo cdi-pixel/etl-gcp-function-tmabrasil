@@ -73,9 +73,7 @@ def _slug(s: str) -> str:
     """
     Normaliza cabeçalhos:
     - remove acentos (NFKD)
-    - 'º'/'°' -> 'o'
-    - '§' vira 's' (e números ficam), '%' -> 'pct'
-    - 'R$' -> 'rs'
+    - 'º'/'°' -> 'o', '§' -> 's', '%' -> 'pct', 'R$' -> 'rs'
     - '/' '-' e espaços -> '_'
     - remove/normaliza pontuação, mantém [a-z0-9_]
     """
@@ -86,7 +84,6 @@ def _slug(s: str) -> str:
     s = s.replace("º", "o").replace("°", "o")
     s = s.replace("%", "pct")
     s = s.replace("/", "_").replace("-", " ")
-    # trata § (mantém números ao redor, ex: "§2º" -> "s2o")
     s = s.replace("§", "s")
     s = unicodedata.normalize("NFKD", s)
     s = "".join(ch for ch in s if not unicodedata.combining(ch))
@@ -104,7 +101,6 @@ def _slug(s: str) -> str:
 
 # mapa de sinônimos de headers → coluna-alvo (usando _slug)
 HEADER_ALIASES: Dict[str, str] = {
-    # ==== mapeamento exato do header informado ====
     "empresa": "empresa",
     "id": "id",
     "sem_arquivos_digitais": "sem_arquivos_digitais",
@@ -116,8 +112,8 @@ HEADER_ALIASES: Dict[str, str] = {
     "cidade": "cidade",
     "estado2": "estado2",
     "vara": "vara",
-    "vara_especializada": "vara_especializada",  # "VARA ESPECIALIZADA?"
-    "pericia_previa": "pericia_previa",          # "PERÍCIA PRÉVIA?"
+    "vara_especializada": "vara_especializada",
+    "pericia_previa": "pericia_previa",
     "empresa_pericia_previa": "empresa_pericia_previa",
     "advogado": "advogado",
     "consultoria_assessoria_financeira_reestruturacao": "consultoria_assessoria_financeira_reestruturacao",
@@ -129,18 +125,18 @@ HEADER_ALIASES: Dict[str, str] = {
     "tipo": "tipo",
     "tamanho_aproximado_da_rj_valor_da_divida_declarado_nos_documentos_iniciais":
         "tamanho_aproximado_da_rj_valor_da_divida_declarado_nos_documentos_iniciais",
-    "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o": "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o",  # "§2º" -> "7o_2o"
+    "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o": "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o",
     "modalidade_de_remuneracao_do_aj": "modalidade_de_remuneracao_do_aj",
-    "remuneracao_aj_pct_do_passivo": "remuneracao_aj_do_passivo",  # "REMUNERAÇÃO AJ (% DO PASSIVO)"
+    "remuneracao_aj_pct_do_passivo": "remuneracao_aj_do_passivo",
     "remuneracao_aj_do_passivo": "remuneracao_aj_do_passivo",
-    "remuneracao_aj_valor_total": "remuneracao_aj_valor_total",    # "REMUNERAÇÃO AJ - VALOR TOTAL"
+    "remuneracao_aj_valor_total": "remuneracao_aj_valor_total",
     "remuneracao_aj_rs_parcelas_mensais_honorarios_provisorios":
         "remuneracao_aj_r_parcelas_mensais_honorarios_provisorios",
     "remuneracao_aj_rs_parcelas_mensais_honorarios_definitivos":
         "remuneracao_aj_r_parcelas_mensais_honorarios_definitivos",
     "quantidade_de_assembleias_para_aprovacao": "quantidade_de_assembleias_para_aprovacao",
     "houve_apresentacao_de_plano_pelos_credores": "houve_apresentacao_de_plano_pelos_credores",
-    "n_processo": "n_processo",                 # cobre "N PROCESSO"
+    "n_processo": "n_processo",
     "link_processo": "link_processo",
     "link_logo": "link_logo",
     "link_ri_outros": "link_ri_outros",
@@ -149,9 +145,9 @@ HEADER_ALIASES: Dict[str, str] = {
     "data_de_manipulacao": "data_de_manipulacao",
     "segredo_de_justica": "segredo_de_justica",
     "processo_fisico_ou_digital": "processo_fisico_ou_digital",
-    "revisao": "revisao",                       # "REVISÃO"
-    "status_processo": "status_do_processo",    # "STATUS PROCESSO"
-    # ==== sinônimos usuais ====
+    "revisao": "revisao",
+    "status_processo": "status_do_processo",
+    # sinônimos usuais:
     "uf": "estado",
     "numero_do_processo": "n_processo",
     "_1o_administrador_judicial": "_1o_administrador_judicial",
@@ -218,9 +214,25 @@ _default_retry = g_retry.Retry(
 def wait_job(job):
     return _default_retry(job.result)()
 
+# ===================== EXCEL SHEET PICKER =====================
+def _pick_sheet(xlsx_path: str) -> str:
+    """
+    Procura a aba 'lista de informações' (com/sem acento, case-insensitive).
+    Aceita variações: 'lista de informacoes', 'Lista de Informações', etc.
+    """
+    xf = pd.ExcelFile(xlsx_path)
+    wanted = {"lista_de_informacoes", "lista_de_informacao"}
+    slug_map = {sh: _slug(sh) for sh in xf.sheet_names}
+    for sh, sl in slug_map.items():
+        if sl in wanted:
+            print(f"[base_fixed] Aba selecionada: '{sh}' (slug='{sl}')")
+            return sh
+    print(f"[base_fixed] Aba 'lista de informações' NÃO encontrada. Abas: {xf.sheet_names}")
+    # Falha suave: usa a primeira (ou troque por raise ValueError)
+    return xf.sheet_names[0]
+
 # ===== Header mapping helpers =====
 def _map_headers_to_targets(cols: List[str]) -> Dict[int, str]:
-    """Retorna um mapa idx->col_alvo quando der para casar por nome."""
     slugs = [_slug(c) for c in cols]
     mapping: Dict[int, str] = {}
     for i, s in enumerate(slugs):
@@ -229,7 +241,6 @@ def _map_headers_to_targets(cols: List[str]) -> Dict[int, str]:
         elif s in BASE_FIXED_COLUMNS:
             mapping[i] = s
         else:
-            # heurísticas simples para os "1º/2º/3º administrador"
             if s.startswith("1") and "administrador" in s:
                 mapping[i] = "_1o_administrador_judicial"
             elif s.startswith("2") and "administrador" in s:
@@ -239,12 +250,24 @@ def _map_headers_to_targets(cols: List[str]) -> Dict[int, str]:
     return mapping
 
 def _looks_like_header(row0: List[str]) -> bool:
-    """Se maioria das células são strings com letras, assume que é header."""
     texts = 0
     for v in row0:
         if isinstance(v, str) and any(ch.isalpha() for ch in v):
             texts += 1
     return texts >= max(3, int(len(row0) * 0.4))
+
+def _debug_header_mapping(cols_excel: List[str], mapping: Dict[int, str]):
+    slugs = [_slug(c) for c in cols_excel]
+    print("[base_fixed][debug] Detalhe de mapeamento de colunas:")
+    for i, (orig, slug) in enumerate(zip(cols_excel, slugs)):
+        tgt = mapping.get(i, "UNMAPPED")
+        print(f"  [{i:02d}] '{orig}'  -> slug='{slug}'  => {tgt}")
+
+def _maybe_normalize_numbers(df: pd.DataFrame, cols_like_money: List[str]):
+    # troca ',' por '.' em strings numéricas, sem forçar tipo (mantemos STRING no BQ)
+    for c in cols_like_money:
+        if c in df.columns:
+            df[c] = df[c].map(lambda v: None if v is None else str(v).replace("\u00A0"," ").replace(",", ".").strip())
 
 # ===== FULL LOAD: base_legal/base_geral =====
 def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
@@ -255,41 +278,74 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     uniq = f"{int(time.time()*1000)}_{uuid.uuid4().hex[:8]}"
     xlsx_path = os.path.join(tempfile.gettempdir(), f"base_fixed_{uniq}.xlsx")
     jsonl_path = os.path.join(tempfile.gettempdir(), f"base_fixed_{uniq}.jsonl")
-    blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
-    blob.download_to_filename(xlsx_path)
+    storage_client.bucket(gcs_bucket).blob(gcs_object).download_to_filename(xlsx_path)
 
-    # Tenta ler com header na primeira linha
-    df_try = pd.read_excel(xlsx_path, header=0)
-    use_header = _looks_like_header(list(df_try.columns))
+    # escolhe a aba certa
+    sheet = _pick_sheet(xlsx_path)
+
+    # 1) Tenta ler assumindo header
+    df_try = pd.read_excel(xlsx_path, header=0, sheet_name=sheet)
+    header_row = list(df_try.columns)
+    use_header = _looks_like_header(header_row)
 
     if use_header:
-        header_mapping = _map_headers_to_targets(list(df_try.columns))
+        header_mapping = _map_headers_to_targets(header_row)
+        _debug_header_mapping(header_row, header_mapping)
+
+        # mapeia por NOME (robusto à ordem)
+        name_to_target = {}
+        for col_name in header_row:
+            slug = _slug(col_name)
+            if slug in HEADER_ALIASES:
+                name_to_target[col_name] = HEADER_ALIASES[slug]
+            elif slug in BASE_FIXED_COLUMNS:
+                name_to_target[col_name] = slug
+
         df = df_try.copy()
         df.dropna(how="all", inplace=True)
         df.reset_index(drop=True, inplace=True)
+
+        std = pd.DataFrame(index=range(len(df)))
+        for c in BASE_FIXED_COLUMNS:
+            std[c] = None
+
+        filled = 0
+        for src_name, tgt_col in name_to_target.items():
+            if tgt_col in std.columns and src_name in df.columns:
+                std.loc[:, tgt_col] = df[src_name]
+                filled += 1
+        print(f"[base_fixed][debug] Colunas preenchidas por nome: {filled}/{len(BASE_FIXED_COLUMNS)}")
+
     else:
-        # Sem header “crível”: lê sem header e NÃO descarta a primeira linha
-        df = pd.read_excel(xlsx_path, header=None)
+        # 2) Fallback POSICIONAL (sem descartar primeira linha)
+        print("[base_fixed][debug] Header não reconhecido, usando fallback POSICIONAL.")
+        df = pd.read_excel(xlsx_path, header=None, sheet_name=sheet)
         df.dropna(how="all", inplace=True)
         df.reset_index(drop=True, inplace=True)
-        # fallback posicional: casa 1:1 até o tamanho de BASE_FIXED_COLUMNS
-        header_mapping = {i: BASE_FIXED_COLUMNS[i] for i in range(min(df.shape[1], len(BASE_FIXED_COLUMNS)))}
 
-    # DataFrame alvo com todas as colunas, inicializadas como None
-    std = pd.DataFrame(index=range(len(df)))
-    for c in BASE_FIXED_COLUMNS:
-        std[c] = None
+        std = pd.DataFrame(index=range(len(df)))
+        for c in BASE_FIXED_COLUMNS:
+            std[c] = None
 
-    # Preenche o que casou por nome/posição
-    for src_idx, tgt_col in header_mapping.items():
-        if src_idx < df.shape[1] and tgt_col in std.columns:
-            std.loc[:, tgt_col] = df.iloc[:, src_idx]
+        for i in range(min(df.shape[1], len(BASE_FIXED_COLUMNS))):
+            std.iloc[:, i] = df.iloc[:, i]
+        print(f"[base_fixed][debug] Preenchidas por posição: {min(df.shape[1], len(BASE_FIXED_COLUMNS))}")
 
-    # Tudo string
+    # normaliza números que costumam vir com vírgula (opcional)
+    _maybe_normalize_numbers(std, [
+        "tamanho_aproximado_da_rj_valor_da_divida_declarado_nos_documentos_iniciais",
+        "passivo_apurado_pelo_aj_no_qgc_do_art_7o_2o",
+        "remuneracao_aj_do_passivo",
+        "remuneracao_aj_valor_total",
+        "remuneracao_aj_r_parcelas_mensais_honorarios_provisorios",
+        "remuneracao_aj_r_parcelas_mensais_honorarios_definitivos",
+    ])
+
+    # tudo STRING
     for c in std.columns:
         std[c] = std[c].map(to_str_or_none)
 
-    # Gera JSONL e carrega com WRITE_TRUNCATE
+    # exporta e carrega
     df_to_jsonl(std, jsonl_path)
     schema = build_string_schema(BASE_FIXED_COLUMNS)
     job_config = bigquery.LoadJobConfig(
@@ -333,8 +389,7 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     xlsx_path  = os.path.join(tempfile.gettempdir(), f"qgc_{uniq}.xlsx")
     jsonl_path = os.path.join(tempfile.gettempdir(), f"qgc_{uniq}.jsonl")
 
-    blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
-    blob.download_to_filename(xlsx_path)
+    storage_client.bucket(gcs_bucket).blob(gcs_object).download_to_filename(xlsx_path)
 
     # Lê SEM header (aceita 8 ou 9 colunas)
     df = pd.read_excel(xlsx_path, header=None)
@@ -426,7 +481,7 @@ def entryPoint(data, context):
     ensure_dataset(bq, BQ_DATASET)
     ensure_status_table(bq)
 
-    # base_legal/base_geral -> FULL LOAD com mapeamento por header (ou posição se não houver header)
+    # base_legal/base_geral -> FULL LOAD na aba 'lista de informações'
     if base.lower() in ("base_legal.xlsx", "base_geral.xlsx"):
         try:
             process_base_fixed(bq, bucket, name)
