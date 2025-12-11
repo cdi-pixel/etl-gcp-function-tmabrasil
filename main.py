@@ -274,7 +274,7 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
         normalized_rows.append(arr)
 
     # Monta DataFrame com 13 primeiras colunas ordenadas e adiciona NOMEARQUIVO/DATAIMPLEMENTACAO
-    df = pd.DataFrame(normalized_rows, columns=QGC_COLUMNS[:9])
+    df = pd.DataFrame(normalized_rows, columns=QGC_COLUMNS[:13])
     df["NOMEARQUIVO"] = base_name
     df["DATAIMPLEMENTACAO"] = now_str
 
