@@ -40,8 +40,14 @@ BASE_FIXED_COLUMNS = [
 
 QGC_COLUMNS = [
     "GRUPO","EMPRESA","FONTE","CLASSE","SUBCLASSE","CREDOR",
-    "MOEDA","VALOR","DATA","NOMEARQUIVO","DATAIMPLEMENTACAO"
+    "MOEDA","VALOR","DATA",
+    
+    "DATA_PRIMEIRA_AGC","PTAX","FONTE_COTACAO","VALOR_BRL", 
+    "NOMEARQUIVO","DATAIMPLEMENTACAO"
 ]
+
+EXPECTED_WITH_SUB = ["GRUPO","EMPRESA","FONTE","CLASSE","SUBCLASSE","CREDOR","MOEDA","VALOR","DATA","DATA_PRIMEIRA_AGC","PTAX","FONTE_COTACAO","VALOR_BRL"]
+EXPECTED_NO_SUB   = ["GRUPO","EMPRESA","FONTE","CLASSE","CREDOR","MOEDA","VALOR","DATA","DATA_PRIMEIRA_AGC","PTAX","FONTE_COTACAO","VALOR_BRL"]
 
 # ===================== HELPERS =====================
 def to_str_or_none(v):
@@ -107,7 +113,7 @@ def log_status(bq: bigquery.Client, nome_arquivo: str, status: str, mensagem: st
         rows = [{
             "data_envio": datetime.utcnow().isoformat(" "),
             "nomearquivo": nome_arquivo,
-            "status": status[:50],
+            "status": (status or "")[:50],
             "mensagem": (mensagem or "")[:1500],
         }]
         bq.insert_rows_json(table_id, rows)
@@ -149,7 +155,7 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     for col in BASE_FIXED_COLUMNS:
         slug = _slug(col)
         src = mapping.get(slug)
-        std[col] = df[src] if src in df.columns else None
+        std[col] = df[src] if (src in df.columns) else None
 
     for c in std.columns:
         std[c] = std[c].map(to_str_or_none)
@@ -164,6 +170,49 @@ def process_base_fixed(bq: bigquery.Client, gcs_bucket: str, gcs_object: str):
     with open(jsonl_path, "rb") as f:
         bq.load_table_from_file(f, table_id, job_config=cfg).result()
     print("[base_fixed] FULL LOAD concluído.")
+
+# ===================== QGC: VALIDAÇÃO DE HEADER =====================
+def _norm(s):
+    return str(s or "").strip().upper()
+
+def validate_qgc_header(header_row):
+    """
+    header_row: list-like com a primeira linha da planilha (nomes das colunas)
+    Retorna (ok: bool, has_subclasse: bool, error_msg: str|None)
+    Regras:
+      - Aceita exatamente EXPECTED_WITH_SUB (13 colunas) OU EXPECTED_NO_SUB (12 colunas).
+      - Colunas obrigatórias (sem SUBCLASSE): GRUPO,EMPRESA,FONTE,CLASSE,CREDOR,MOEDA,VALOR,DATA,DATA_PRIMEIRA_AGC,PTAX,FONTE_COTACAO,VALOR_BRL
+      - Ordem deve bater 100%.
+    """
+    if header_row is None:
+        return (False, False, "Cabeçalho não encontrado")
+
+    header = [_norm(x) for x in list(header_row)]
+    # Remove colunas vazias no fim
+    while header and header[-1] == "":
+        header.pop()
+
+    required = ["GRUPO","EMPRESA","FONTE","CLASSE","CREDOR","MOEDA","VALOR","DATA","DATA_PRIMEIRA_AGC","PTAX","FONTE_COTACAO","VALOR_BRL"]
+    for r in required:
+        if r not in header:
+            return (False, False, f"{r} não veio")
+
+    # Checar ordem com SUBCLASSE (13 primeiras)
+    if len(header) >= 13:
+        first9 = header[:13]
+        if all(first9[i] == EXPECTED_WITH_SUB[i] for i in range(13)):
+            return (True, True, None)
+
+    # Checar ordem sem SUBCLASSE (12 primeiras)
+    if len(header) >= 12:
+        first8 = header[:12]
+        if all(first8[i] == EXPECTED_NO_SUB[i] for i in range(12)):
+            return (True, False, None)
+
+    got = ", ".join(header[:13])
+    exp1 = ", ".join(EXPECTED_WITH_SUB)
+    exp2 = ", ".join(EXPECTED_NO_SUB)
+    return (False, False, f"Ordem inválida. Esperado: [{exp1}] ou [{exp2}] — Recebido: [{got}]")
 
 # ===================== QGC INCREMENTAL =====================
 def ensure_qgc_table(bq: bigquery.Client):
@@ -188,20 +237,44 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
     blob = storage_client.bucket(gcs_bucket).blob(gcs_object)
     blob.download_to_filename(xlsx_path)
 
-    df = pd.read_excel(xlsx_path, header=None)
-    df.dropna(how="all", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    if len(df) >= 1:
-        df = df.iloc[1:].reset_index(drop=True)
+    # Ler tudo como matriz (preservando header visual)
+    df_matrix = pd.read_excel(xlsx_path, header=None)
+    # Remover linhas totalmente vazias
+    df_matrix = df_matrix.dropna(how="all")
+    if df_matrix.empty:
+        raise BadRequest("Planilha vazia.")
 
-    if df.shape[1] == 8:
-        df.insert(4, "__SUBCLASSE_MISSING__", None)
-    if df.shape[1] < 9:
-        for _ in range(9 - df.shape[1]):
-            df[df.shape[1]] = None
-    if df.shape[1] > 9:
-        df = df.iloc[:, :9]
-    df.columns = QGC_COLUMNS[:9]
+    # HEADER BRUTO (primeira linha)
+    header_row = df_matrix.iloc[0, :].tolist()
+    ok, has_subclasse, err = validate_qgc_header(header_row)
+    if not ok:
+        # Sinalizar erro ao usuário via status e abortar import
+        raise BadRequest(err)
+
+    # Dados (sem o header)
+    data_only = df_matrix.iloc[1:, :].copy()
+    # Normaliza cada linha para 9 colunas (GRUPO..DATA), inserindo SUBCLASSE vazia quando necessário
+    normalized_rows = []
+    for _, row in data_only.iterrows():
+        arr = row.tolist()
+        # Limpa trailing vazios (caso tenha colunas a mais em branco no fim)
+        while len(arr) and (arr[-1] is None or str(arr[-1]).strip() == ""):
+            arr.pop()
+
+        # Se não tem SUBCLASSE (12 colunas), inserir None na posição 4
+        if not has_subclasse and len(arr) >= 12:
+            arr = arr[:4] + [None] + arr[4:]
+
+        # Completar até 13 (GRUPO..DATA); cortar se > 13
+        if len(arr) < 13:
+            arr.extend([None] * (13 - len(arr)))
+        elif len(arr) > 13:
+            arr = arr[:13]
+
+        normalized_rows.append(arr)
+
+    # Monta DataFrame com 13 primeiras colunas ordenadas e adiciona NOMEARQUIVO/DATAIMPLEMENTACAO
+    df = pd.DataFrame(normalized_rows, columns=QGC_COLUMNS[:9])
     df["NOMEARQUIVO"] = base_name
     df["DATAIMPLEMENTACAO"] = now_str
 
@@ -210,7 +283,7 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
 
     staging = f"{PROJECT_ID}.{BQ_DATASET}._stage_{uniq}"
     jsonl = os.path.join(tempfile.gettempdir(), f"stage_{uniq}.jsonl")
-    df_to_jsonl(df, jsonl)
+    df_to_jsonl(df[QGC_COLUMNS], jsonl)
     ensure_qgc_table(bq)
 
     load_cfg = bigquery.LoadJobConfig(
@@ -231,7 +304,7 @@ def process_qgc_incremental(bq: bigquery.Client, gcs_bucket: str, gcs_object: st
       VALUES ({', '.join('S.' + c for c in QGC_COLUMNS)});
     """
 
-    for attempt in range(1, 8):
+    for attempt in range(1, 12):
         try:
             bq.query(sql).result()
             print(f"[qgc] MERGE concluído ({attempt} tentativa).")
@@ -256,16 +329,17 @@ def entryPoint(data, context):
         return
 
     base = os.path.basename(name)
-    bq = bigquery.Client()
-    ensure_dataset(bq, BQ_DATASET)
-    ensure_status_table(bq)
+    bq_client = bigquery.Client()
+    ensure_dataset(bq_client, BQ_DATASET)
+    ensure_status_table(bq_client)
 
     try:
         if base.lower() in ("base_geral.xlsx", "base_legal.xlsx"):
-            process_base_fixed(bq, bucket, name)
+            process_base_fixed(bq_client, bucket, name)
         elif base.lower().endswith(".xlsx"):
-            process_qgc_incremental(bq, bucket, name)
-        log_status(bq, base, "SUCESSO", "Implementado com sucesso.")
+            process_qgc_incremental(bq_client, bucket, name)
+        log_status(bq_client, base, "SUCESSO", "Implementado com sucesso.")
     except Exception as e:
-        log_status(bq, base, "ERRO", str(e))
+        # Registro de erro e propagação p/ a plataforma entender que falhou
+        log_status(bq_client, base, "ERRO", str(e))
         raise
